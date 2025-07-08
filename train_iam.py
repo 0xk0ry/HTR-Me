@@ -255,6 +255,9 @@ def train_epoch(model, dataloader, optimizer, device, use_sam=False):
 
             optimizer.step()
 
+        # Ensure loss is floating point for item()
+        if not loss.dtype.is_floating_point:
+            loss = loss.float()
         total_loss += loss.item()
         num_batches += 1
 
@@ -282,9 +285,11 @@ def validate(model, dataloader, device, decoder):
             target_lengths = target_lengths.to(device)
 
             logits, loss = model(images, targets, target_lengths)
-            # Ensure loss is scalar
+            # Ensure loss is scalar and floating point
             if loss.numel() > 1:
-                loss = loss.mean()
+                loss = loss.float().mean()
+            elif not loss.dtype.is_floating_point:
+                loss = loss.float()
             total_loss += loss.item()
             num_batches += 1
 
