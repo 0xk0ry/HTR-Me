@@ -200,7 +200,7 @@ class CvT(nn.Module):
 class ImageChunker:
     """Handles image chunking with overlapping and padding"""
 
-    def __init__(self, target_height=40, chunk_width=256, stride=192, padding=32):
+    def __init__(self, target_height=40, chunk_width=320, stride=240, padding=40):
         self.target_height = target_height
         self.chunk_width = chunk_width
         self.stride = stride
@@ -234,7 +234,7 @@ class ImageChunker:
         return image
 
     def create_chunks(self, image):
-        """Create overlapping chunks with bidirectional padding"""
+        """Create overlapping chunks with grey padding for first and last chunks"""
         # Convert to tensor if needed
         if isinstance(image, (np.ndarray, Image.Image)):
             transform = transforms.Compose([
@@ -253,76 +253,71 @@ class ImageChunker:
         chunks = []
         chunk_positions = []
 
-        # Calculate number of chunks needed
-        if W <= self.chunk_width:
-            # Single chunk case
-            padded_chunk = F.pad(
-                image_tensor, (self.padding, self.padding, 0, 0), mode='reflect')
-            # Ensure consistent width
-            target_width = self.chunk_width + 2 * self.padding
-            if padded_chunk.size(2) < target_width:
-                # Pad to target width, but be careful with reflect mode
-                extra_pad = target_width - padded_chunk.size(2)
-                max_pad = min(extra_pad, padded_chunk.size(2) - 1)
-                if max_pad > 0:
-                    padded_chunk = F.pad(
-                        padded_chunk, (0, max_pad, 0, 0), mode='reflect')
-                # If still not enough, pad with zeros
-                if padded_chunk.size(2) < target_width:
-                    remaining_pad = target_width - padded_chunk.size(2)
-                    padded_chunk = F.pad(
-                        padded_chunk, (0, remaining_pad, 0, 0), mode='constant', value=0)
-            elif padded_chunk.size(2) > target_width:
-                # Crop to target width
-                padded_chunk = padded_chunk[:, :, :target_width]
+        # Calculate overlap size
+        overlap_size = self.chunk_width - self.stride  # 320 - 240 = 80px
 
-            chunks.append(padded_chunk.unsqueeze(0))
+        if W <= self.chunk_width - self.padding:
+            # Single chunk case
+            # Add left padding (40px grey)
+            chunk = F.pad(image_tensor, (self.padding, 0, 0, 0), mode='constant', value=0.5)
+            
+            # Add right padding if needed to reach chunk_width
+            current_width = chunk.size(2)
+            if current_width < self.chunk_width:
+                right_pad = self.chunk_width - current_width
+                chunk = F.pad(chunk, (0, right_pad, 0, 0), mode='constant', value=0.5)
+            
+            chunks.append(chunk.unsqueeze(0))
             chunk_positions.append((0, W, self.padding, self.padding + W))
         else:
             # Multiple chunks case
             start = 0
+            chunk_idx = 0
+
             while start < W:
-                end = min(start + self.chunk_width, W)
+                is_first_chunk = (chunk_idx == 0)
+                
+                if is_first_chunk:
+                    # First chunk: content from 0 to (chunk_width - padding)
+                    # This leaves room for the 40px left padding
+                    content_width = self.chunk_width - self.padding  # 320 - 40 = 280px
+                    end = min(start + content_width, W)
+                else:
+                    # Subsequent chunks: normal chunk_width
+                    end = min(start + self.chunk_width, W)
 
-                # Extract chunk
+                # Extract chunk content
                 chunk = image_tensor[:, :, start:end]
+                chunk_width = end - start
 
-                # Add bidirectional padding
-                left_pad = self.padding if start > 0 else 0
-                right_pad = self.padding if end < W else 0
+                # Add left padding for first chunk
+                if is_first_chunk:
+                    chunk = F.pad(chunk, (self.padding, 0, 0, 0), mode='constant', value=0.5)
 
-                # Pad the chunk
-                padded_chunk = F.pad(
-                    chunk, (left_pad, right_pad, 0, 0), mode='reflect')
+                # Add right padding for last chunk if needed
+                current_width = chunk.size(2)
+                if current_width < self.chunk_width:
+                    right_pad = self.chunk_width - current_width
+                    chunk = F.pad(chunk, (0, right_pad, 0, 0), mode='constant', value=0.5)
 
-                # Ensure all chunks have the same width
-                target_width = self.chunk_width + 2 * self.padding
-                current_width = padded_chunk.size(2)
-
-                if current_width < target_width:
-                    # Pad to target width, but limit padding to available space
-                    extra_pad = target_width - current_width
-                    # Can't pad more than input size - 1
-                    max_pad = min(extra_pad, current_width - 1)
-                    if max_pad > 0:
-                        padded_chunk = F.pad(
-                            padded_chunk, (0, max_pad, 0, 0), mode='reflect')
-                    # If still not enough, pad with zeros
-                    if padded_chunk.size(2) < target_width:
-                        remaining_pad = target_width - padded_chunk.size(2)
-                        padded_chunk = F.pad(
-                            padded_chunk, (0, remaining_pad, 0, 0), mode='constant', value=0)
-                elif current_width > target_width:
-                    # Crop to target width
-                    padded_chunk = padded_chunk[:, :, :target_width]
-
-                chunks.append(padded_chunk.unsqueeze(0))
-                chunk_positions.append(
-                    (start, end, left_pad, left_pad + (end - start)))
+                chunks.append(chunk.unsqueeze(0))
+                
+                # Store position info: (start, end, left_pad, content_end_in_chunk)
+                left_pad = self.padding if is_first_chunk else 0
+                chunk_positions.append((start, end, left_pad, left_pad + chunk_width))
 
                 if end >= W:
                     break
-                start += self.stride
+
+                if is_first_chunk:
+                    # For first chunk, next start maintains overlap
+                    # First chunk covers 0-280, next should start at 280-80=200
+                    start = end - overlap_size  # 280 - 80 = 200
+                else:
+                    # For subsequent chunks, use stride with overlap
+                    start += self.stride  # Maintains 80px overlap
+
+                chunk_idx += 1
 
         return torch.cat(chunks, dim=0), chunk_positions
 
@@ -330,8 +325,8 @@ class ImageChunker:
 class HTRModel(nn.Module):
     """Handwritten Text Recognition Model with CvT backbone"""
 
-    def __init__(self, vocab_size, max_length=256, target_height=40, chunk_width=256,
-                 stride=192, padding=32, embed_dims=[64, 192, 384], num_heads=[1, 3, 6],
+    def __init__(self, vocab_size, max_length=256, target_height=40, chunk_width=320,
+                 stride=240, padding=40, embed_dims=[64, 192, 384], num_heads=[1, 3, 6],
                  depths=[1, 2, 10]):
         super().__init__()
 
@@ -341,8 +336,9 @@ class HTRModel(nn.Module):
             target_height, chunk_width, stride, padding)
 
         # CvT backbone for feature extraction
+        # All chunks will be exactly chunk_width (320px) wide
         self.cvt = CvT(
-            img_size=chunk_width + 2*padding,  # Account for padding
+            img_size=chunk_width,  # 320px
             in_chans=3,
             embed_dims=embed_dims,
             num_heads=num_heads,
@@ -418,50 +414,74 @@ class HTRModel(nn.Module):
             return padded_logits, torch.tensor(all_lengths, device=images.device)
 
     def _merge_chunk_features(self, chunk_features, chunk_positions):
-        """Merge features from multiple chunks, removing padded regions"""
+        """Merge features from multiple chunks, removing padded and ignored regions during merging"""
         merged_features = []
+        overlap_size = self.chunker.chunk_width - self.chunker.stride  # 80px
+        ignored_size = 40  # 40px ignored from each side of overlap during merging
 
-        for i, (features, (start, end, left_pad, right_boundary)) in enumerate(zip(chunk_features, chunk_positions)):
+        for i, (features, (start, end, left_pad, content_end_in_chunk)) in enumerate(zip(chunk_features, chunk_positions)):
             # features shape: [1, seq_len, feature_dim]
             features = features.squeeze(0)  # [seq_len, feature_dim]
+            total_feature_width = features.size(0)
 
-            # Calculate which tokens correspond to valid (non-padded) regions
-            # This depends on the CvT's downsampling factor
-            total_width = features.size(0)
-
-            # Approximate mapping from feature positions to image positions
-            # This is a simplified approach - in practice, you might need to be more precise
             if len(chunk_positions) == 1:
-                # Single chunk - remove padding from both sides
-                start_idx = max(0, left_pad * total_width //
-                                (right_boundary + self.chunker.padding - left_pad))
-                end_idx = min(total_width, (left_pad + (end - start)) * total_width //
-                              (right_boundary + self.chunker.padding - left_pad))
-                valid_features = features[start_idx:end_idx]
+                # Single chunk - remove left padding only
+                if left_pad > 0:
+                    # Calculate feature positions corresponding to padding
+                    padding_ratio = left_pad / self.chunker.chunk_width
+                    padding_features = int(padding_ratio * total_feature_width)
+                    valid_features = features[padding_features:]
+                else:
+                    valid_features = features
             else:
                 if i == 0:
-                    # First chunk - remove right padding
-                    end_idx = total_width - \
-                        (self.chunker.padding * total_width //
-                         (self.chunker.chunk_width + self.chunker.padding))
-                    valid_features = features[:end_idx]
+                    # First chunk - remove left padding and ignored region on right
+                    start_idx = 0
+                    if left_pad > 0:
+                        padding_ratio = left_pad / self.chunker.chunk_width
+                        padding_features = int(padding_ratio * total_feature_width)
+                        start_idx = padding_features
+                    
+                    # Remove ignored region from right (40px from the end)
+                    if i < len(chunk_positions) - 1:  # Not the last chunk
+                        ignored_ratio = ignored_size / self.chunker.chunk_width
+                        ignored_features = int(ignored_ratio * total_feature_width)
+                        end_idx = total_feature_width - ignored_features
+                    else:
+                        end_idx = total_feature_width
+                    
+                    valid_features = features[start_idx:end_idx]
+                        
                 elif i == len(chunk_positions) - 1:
-                    # Last chunk - remove left padding
-                    start_idx = left_pad * \
-                        total_width // (right_boundary +
-                                        self.chunker.padding - left_pad)
-                    valid_features = features[start_idx:]
+                    # Last chunk - remove ignored region from left
+                    chunk_actual_width = end - start
+                    if chunk_actual_width < self.chunker.chunk_width:
+                        # This chunk was padded on the right, but features should be from content only
+                        content_ratio = chunk_actual_width / self.chunker.chunk_width
+                        content_features = int(content_ratio * total_feature_width)
+                        
+                        # Remove ignored region from the beginning (40px)
+                        ignored_ratio = ignored_size / chunk_actual_width
+                        ignored_features = int(ignored_ratio * content_features)
+                        valid_features = features[ignored_features:content_features]
+                    else:
+                        # No right padding, just remove ignored region from left
+                        ignored_ratio = ignored_size / self.chunker.chunk_width
+                        ignored_features = int(ignored_ratio * total_feature_width)
+                        valid_features = features[ignored_features:]
+                        
                 else:
-                    # Middle chunk - remove both paddings
-                    start_idx = left_pad * \
-                        total_width // (right_boundary +
-                                        self.chunker.padding - left_pad)
-                    end_idx = total_width - \
-                        (self.chunker.padding * total_width //
-                         (right_boundary + self.chunker.padding - left_pad))
+                    # Middle chunk - remove ignored regions from both sides (40px each)
+                    ignored_ratio = ignored_size / self.chunker.chunk_width
+                    ignored_features = int(ignored_ratio * total_feature_width)
+                    
+                    # Remove ignored regions from both beginning and end
+                    start_idx = ignored_features
+                    end_idx = total_feature_width - ignored_features
                     valid_features = features[start_idx:end_idx]
 
-            merged_features.append(valid_features)
+            if valid_features.size(0) > 0:
+                merged_features.append(valid_features)
 
         # Concatenate all valid features
         if merged_features:
@@ -692,9 +712,9 @@ def create_model_example():
         vocab_size=vocab_size,
         max_length=256,
         target_height=40,
-        chunk_width=256,
-        stride=192,
-        padding=32,
+        chunk_width=320,
+        stride=240,
+        padding=40,
         embed_dims=[64, 192, 384],
         num_heads=[1, 3, 6],
         depths=[1, 2, 10]
