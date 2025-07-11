@@ -259,14 +259,16 @@ class ImageChunker:
         if W <= self.chunk_width - self.padding:
             # Single chunk case
             # Add left padding (40px grey)
-            chunk = F.pad(image_tensor, (self.padding, 0, 0, 0), mode='constant', value=0.5)
-            
+            chunk = F.pad(image_tensor, (self.padding, 0, 0, 0),
+                          mode='constant', value=0.5)
+
             # Add right padding if needed to reach chunk_width
             current_width = chunk.size(2)
             if current_width < self.chunk_width:
                 right_pad = self.chunk_width - current_width
-                chunk = F.pad(chunk, (0, right_pad, 0, 0), mode='constant', value=0.5)
-            
+                chunk = F.pad(chunk, (0, right_pad, 0, 0),
+                              mode='constant', value=0.5)
+
             chunks.append(chunk.unsqueeze(0))
             chunk_positions.append((0, W, self.padding, self.padding + W))
         else:
@@ -276,7 +278,7 @@ class ImageChunker:
 
             while start < W:
                 is_first_chunk = (chunk_idx == 0)
-                
+
                 if is_first_chunk:
                     # First chunk: content from 0 to (chunk_width - padding)
                     # This leaves room for the 40px left padding
@@ -292,19 +294,22 @@ class ImageChunker:
 
                 # Add left padding for first chunk
                 if is_first_chunk:
-                    chunk = F.pad(chunk, (self.padding, 0, 0, 0), mode='constant', value=0.5)
+                    chunk = F.pad(chunk, (self.padding, 0, 0, 0),
+                                  mode='constant', value=0.5)
 
                 # Add right padding for last chunk if needed
                 current_width = chunk.size(2)
                 if current_width < self.chunk_width:
                     right_pad = self.chunk_width - current_width
-                    chunk = F.pad(chunk, (0, right_pad, 0, 0), mode='constant', value=0.5)
+                    chunk = F.pad(chunk, (0, right_pad, 0, 0),
+                                  mode='constant', value=0.5)
 
                 chunks.append(chunk.unsqueeze(0))
-                
+
                 # Store position info: (start, end, left_pad, content_end_in_chunk)
                 left_pad = self.padding if is_first_chunk else 0
-                chunk_positions.append((start, end, left_pad, left_pad + chunk_width))
+                chunk_positions.append(
+                    (start, end, left_pad, left_pad + chunk_width))
 
                 if end >= W:
                     break
@@ -376,32 +381,32 @@ class HTRModel(nn.Module):
             # Create chunks
             chunks, chunk_positions = self.chunker.create_chunks(image)
 
-            # Process each chunk through CvT
+            # Process each chunk through CvT and extract time-sequence features
             chunk_features = []
             for chunk in chunks:
                 # chunk has shape [C, H, W], need to add batch dimension
                 chunk = chunk.unsqueeze(0)  # [1, C, H, W]
-                features, (H, W) = self.cvt.forward_features(chunk)
+                features = self.forward_features(chunk)  # [W', C]
                 chunk_features.append(features)
 
-            # Merge chunks by removing padding and concatenating
+            # Merge chunks by removing padding and ignored regions
             merged_features = self._merge_chunk_features(
-                chunk_features, chunk_positions)
+                chunk_features, chunk_positions)  # [T_total, C]
 
             # Apply classifier
-            logits = self.classifier(merged_features)  # [seq_len, vocab_size]
+            logits = self.classifier(merged_features)  # [T_total, vocab_size]
             all_logits.append(logits)
             all_lengths.append(logits.size(0))
 
         # Pad sequences to same length
-        max_seq_len = max(all_lengths)
+        max_seq_len = max(all_lengths) if all_lengths else 1
         padded_logits = torch.zeros(
             batch_size, max_seq_len, self.vocab_size, device=images.device)
 
         for i, (logits, length) in enumerate(zip(all_logits, all_lengths)):
             padded_logits[i, :length] = logits
 
-        # Transpose for CTC: [seq_len, batch_size, vocab_size]
+        # Transpose for CTC: [T_max, B, vocab_size] as required by CTC
         padded_logits = padded_logits.transpose(0, 1)
 
         if self.training and targets is not None:
@@ -413,71 +418,83 @@ class HTRModel(nn.Module):
         else:
             return padded_logits, torch.tensor(all_lengths, device=images.device)
 
+    def forward_features(self, x_chunk):
+        """Extract features from a single chunk and convert to time sequence"""
+        # x_chunk shape: [1, C, H, W] (single chunk with batch dim)
+        features, (H_prime, W_prime) = self.cvt.forward_features(x_chunk)
+        # features shape: [1, H'*W', C]
+        
+        # Reshape to separate spatial dimensions
+        features = features.reshape(1, H_prime, W_prime, -1)  # [1, H', W', C]
+        
+        # Collapse height dimension (average pooling across height)
+        features = features.mean(dim=1)  # [1, W', C]
+        
+        # Squeeze batch dimension for consistency with merging
+        features = features.squeeze(0)  # [W', C]
+        
+        return features
+
     def _merge_chunk_features(self, chunk_features, chunk_positions):
         """Merge features from multiple chunks, removing padded and ignored regions during merging"""
+        if not chunk_features:
+            return torch.empty(0, self.feature_dim, device=chunk_features[0].device if chunk_features else 'cpu')
+        
         merged_features = []
-        overlap_size = self.chunker.chunk_width - self.chunker.stride  # 80px
         ignored_size = 40  # 40px ignored from each side of overlap during merging
+        
+        # Get patch stride for converting pixel positions to patch indices
+        patch_stride = self.cvt.patch_embed.stride
+        
+        # Convert ignore size from pixels to patches
+        ignore_patches = ignored_size // patch_stride
 
-        for i, (features, (start, end, left_pad, content_end_in_chunk)) in enumerate(zip(chunk_features, chunk_positions)):
-            # features shape: [1, seq_len, feature_dim]
-            features = features.squeeze(0)  # [seq_len, feature_dim]
-            total_feature_width = features.size(0)
+        for i, (features, (start_px, end_px, left_pad_px, content_end_in_chunk_px)) in enumerate(zip(chunk_features, chunk_positions)):
+            # features shape: [W', C] where W' is number of patches along width
+            total_patches = features.size(0)
 
             if len(chunk_positions) == 1:
                 # Single chunk - remove left padding only
-                if left_pad > 0:
-                    # Calculate feature positions corresponding to padding
-                    padding_ratio = left_pad / self.chunker.chunk_width
-                    padding_features = int(padding_ratio * total_feature_width)
-                    valid_features = features[padding_features:]
+                if left_pad_px > 0:
+                    # Convert padding pixels to patch indices
+                    padding_patches = left_pad_px // patch_stride
+                    valid_features = features[padding_patches:]
                 else:
                     valid_features = features
             else:
                 if i == 0:
                     # First chunk - remove left padding and ignored region on right
                     start_idx = 0
-                    if left_pad > 0:
-                        padding_ratio = left_pad / self.chunker.chunk_width
-                        padding_features = int(padding_ratio * total_feature_width)
-                        start_idx = padding_features
-                    
-                    # Remove ignored region from right (40px from the end)
+                    if left_pad_px > 0:
+                        # Convert padding pixels to patch indices
+                        padding_patches = left_pad_px // patch_stride
+                        start_idx = padding_patches
+
+                    # Remove ignored region from right
                     if i < len(chunk_positions) - 1:  # Not the last chunk
-                        ignored_ratio = ignored_size / self.chunker.chunk_width
-                        ignored_features = int(ignored_ratio * total_feature_width)
-                        end_idx = total_feature_width - ignored_features
+                        end_idx = total_patches - ignore_patches
                     else:
-                        end_idx = total_feature_width
-                    
+                        end_idx = total_patches
+
                     valid_features = features[start_idx:end_idx]
-                        
+
                 elif i == len(chunk_positions) - 1:
                     # Last chunk - remove ignored region from left
-                    chunk_actual_width = end - start
-                    if chunk_actual_width < self.chunker.chunk_width:
-                        # This chunk was padded on the right, but features should be from content only
-                        content_ratio = chunk_actual_width / self.chunker.chunk_width
-                        content_features = int(content_ratio * total_feature_width)
-                        
-                        # Remove ignored region from the beginning (40px)
-                        ignored_ratio = ignored_size / chunk_actual_width
-                        ignored_features = int(ignored_ratio * content_features)
-                        valid_features = features[ignored_features:content_features]
+                    chunk_actual_width_px = end_px - start_px
+                    chunk_actual_patches = chunk_actual_width_px // patch_stride
+                    
+                    if chunk_actual_width_px < self.chunker.chunk_width:
+                        # This chunk was padded on the right
+                        # Remove ignored region from the beginning
+                        valid_features = features[ignore_patches:chunk_actual_patches]
                     else:
                         # No right padding, just remove ignored region from left
-                        ignored_ratio = ignored_size / self.chunker.chunk_width
-                        ignored_features = int(ignored_ratio * total_feature_width)
-                        valid_features = features[ignored_features:]
-                        
+                        valid_features = features[ignore_patches:]
+
                 else:
-                    # Middle chunk - remove ignored regions from both sides (40px each)
-                    ignored_ratio = ignored_size / self.chunker.chunk_width
-                    ignored_features = int(ignored_ratio * total_feature_width)
-                    
-                    # Remove ignored regions from both beginning and end
-                    start_idx = ignored_features
-                    end_idx = total_feature_width - ignored_features
+                    # Middle chunk - remove ignored regions from both sides
+                    start_idx = ignore_patches
+                    end_idx = total_patches - ignore_patches
                     valid_features = features[start_idx:end_idx]
 
             if valid_features.size(0) > 0:
@@ -485,9 +502,9 @@ class HTRModel(nn.Module):
 
         # Concatenate all valid features
         if merged_features:
-            return torch.cat(merged_features, dim=0)
+            return torch.cat(merged_features, dim=0)  # [T_total, C]
         else:
-            return torch.empty(0, chunk_features[0].size(-1), device=chunk_features[0].device)
+            return torch.empty(0, self.feature_dim, device=chunk_features[0].device)
 
 
 class CTCDecoder:
