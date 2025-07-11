@@ -197,22 +197,16 @@ def collate_fn(batch):
 
     images_tensor = torch.stack(padded_images, 0)
 
-    # Pad text sequences to same length
-    if text_lengths:
-        max_text_len = max(text_lengths)
-        padded_texts = torch.zeros(
-            len(text_indices), max_text_len, dtype=torch.long)
-
-        for i, text in enumerate(text_indices):
-            if len(text) > 0:
-                padded_texts[i, :len(text)] = torch.tensor(
-                    text, dtype=torch.long)
-    else:
-        padded_texts = torch.zeros(len(text_indices), 1, dtype=torch.long)
-
+    # Convert text indices to a single concatenated tensor for CTC
+    # CTC expects targets as a 1D tensor with all sequences concatenated
+    concatenated_targets = []
+    for text in text_indices:
+        concatenated_targets.extend(text)
+    
+    targets_tensor = torch.tensor(concatenated_targets, dtype=torch.long)
     text_lengths_tensor = torch.tensor(text_lengths, dtype=torch.long)
 
-    return images_tensor, padded_texts, text_lengths_tensor, texts, image_names
+    return images_tensor, targets_tensor, text_lengths_tensor, texts, image_names
 
 
 def train_epoch(model, dataloader, optimizer, device, use_sam=False):
@@ -223,47 +217,57 @@ def train_epoch(model, dataloader, optimizer, device, use_sam=False):
 
     progress_bar = tqdm(dataloader, desc="Training")
 
-    # for batch in progress_bar:
-    for batch in dataloader:
+    for batch_idx, batch in enumerate(dataloader):
         images, targets, target_lengths, texts, image_names = batch
         images = images.to(device)
         targets = targets.to(device)
         target_lengths = target_lengths.to(device)
 
-        if use_sam:
-            # SAM training step
-            def closure():
+        try:
+            if use_sam:
+                # SAM training step
+                def closure():
+                    optimizer.zero_grad()
+                    logits, loss = model(images, targets, target_lengths)
+                    loss.backward()
+                    return loss
+
+                # First forward-backward pass
+                loss = closure()
+                optimizer.first_step(zero_grad=True)
+
+                # Second forward-backward pass
+                closure()
+                optimizer.second_step(zero_grad=True)
+            else:
+                # Standard training step
                 optimizer.zero_grad()
                 logits, loss = model(images, targets, target_lengths)
+                
                 loss.backward()
-                return loss
 
-            # First forward-backward pass
-            loss = closure()
-            optimizer.first_step(zero_grad=True)
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            # Second forward-backward pass
-            closure()
-            optimizer.second_step(zero_grad=True)
-        else:
-            # Standard training step
-            optimizer.zero_grad()
-            logits, loss = model(images, targets, target_lengths)
-            loss.backward()
+                optimizer.step()
 
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # Ensure loss is floating point for item()
+            if not loss.dtype.is_floating_point:
+                loss = loss.float()
+            total_loss += loss.item()
+            num_batches += 1
 
-            optimizer.step()
-
-        # Ensure loss is floating point for item()
-        if not loss.dtype.is_floating_point:
-            loss = loss.float()
-        total_loss += loss.item()
-        num_batches += 1
-
-        # Update progress bar
-        progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
+            # Update progress bar
+            progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
+            
+        except Exception as e:
+            print(f"\nError in batch {batch_idx}: {e}")
+            print(f"Batch info:")
+            print(f"  Images shape: {images.shape}")
+            print(f"  Target lengths: {target_lengths.tolist()}")
+            print(f"  Targets shape: {targets.shape}")
+            print(f"  Texts: {texts}")
+            raise e
 
     return total_loss / num_batches
 
@@ -340,11 +344,11 @@ def main():
     # Model arguments
     parser.add_argument('--target_height', type=int, default=40,
                         help='Target image height')
-    parser.add_argument('--chunk_width', type=int, default=256,
+    parser.add_argument('--chunk_width', type=int, default=320,
                         help='Chunk width for processing')
-    parser.add_argument('--stride', type=int, default=192,
+    parser.add_argument('--stride', type=int, default=240,
                         help='Stride for chunking')
-    parser.add_argument('--padding', type=int, default=32,
+    parser.add_argument('--padding', type=int, default=40,
                         help='Padding for chunks')
 
     # Optimizer arguments
