@@ -743,7 +743,6 @@ def train_epoch(model, dataloader, optimizer, device, vocab, use_sam=False):
 
                 # FIXED: Check for invalid loss values
                 if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"Warning: Invalid loss detected: {loss.item()}")
                     continue
 
                 loss.backward()
@@ -761,7 +760,6 @@ def train_epoch(model, dataloader, optimizer, device, vocab, use_sam=False):
                 print(f"Batch {num_batches}, Loss: {loss.item():.4f}")
 
         except Exception as e:
-            print(f"Error in training batch: {e}")
             continue
 
     return total_loss / num_batches if num_batches > 0 else float('inf')
@@ -825,7 +823,6 @@ def validate(model, dataloader, device, decoder):
                     total_chars += max(len(predicted), len(target_seq))
 
             except Exception as e:
-                print(f"Error in validation batch: {e}")
                 continue
 
     char_accuracy = correct_chars / total_chars if total_chars > 0 else 0

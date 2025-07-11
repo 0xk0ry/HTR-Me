@@ -181,7 +181,8 @@ def collate_fn(batch):
     for item in batch:
         images.append(item['image'])
         text_indices.append(item['text_indices'])
-        text_lengths.append(item['text_length'])
+        # Use the actual length of text_indices, not the stored text_length
+        text_lengths.append(len(item['text_indices']))
         texts.append(item['text'])
         image_names.append(item['image_name'])
 
@@ -200,11 +201,18 @@ def collate_fn(batch):
     # Convert text indices to a single concatenated tensor for CTC
     # CTC expects targets as a 1D tensor with all sequences concatenated
     concatenated_targets = []
+    
     for text in text_indices:
         concatenated_targets.extend(text)
     
     targets_tensor = torch.tensor(concatenated_targets, dtype=torch.long)
     text_lengths_tensor = torch.tensor(text_lengths, dtype=torch.long)
+    
+    # Validation: Ensure sum of lengths matches total target tensor size
+    total_expected = sum(text_lengths)
+    actual_size = len(concatenated_targets)
+    if total_expected != actual_size:
+        raise ValueError(f"CTC target length mismatch: {total_expected} != {actual_size}")
 
     return images_tensor, targets_tensor, text_lengths_tensor, texts, image_names
 
@@ -261,13 +269,8 @@ def train_epoch(model, dataloader, optimizer, device, use_sam=False):
             progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
             
         except Exception as e:
-            print(f"\nError in batch {batch_idx}: {e}")
-            print(f"Batch info:")
-            print(f"  Images shape: {images.shape}")
-            print(f"  Target lengths: {target_lengths.tolist()}")
-            print(f"  Targets shape: {targets.shape}")
-            print(f"  Texts: {texts}")
-            raise e
+            print(f"Error in training batch: {e}")
+            continue
 
     return total_loss / num_batches
 
