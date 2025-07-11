@@ -201,18 +201,19 @@ def collate_fn(batch):
     # Convert text indices to a single concatenated tensor for CTC
     # CTC expects targets as a 1D tensor with all sequences concatenated
     concatenated_targets = []
-    
+
     for text in text_indices:
         concatenated_targets.extend(text)
-    
+
     targets_tensor = torch.tensor(concatenated_targets, dtype=torch.long)
     text_lengths_tensor = torch.tensor(text_lengths, dtype=torch.long)
-    
+
     # Validation: Ensure sum of lengths matches total target tensor size
     total_expected = sum(text_lengths)
     actual_size = len(concatenated_targets)
     if total_expected != actual_size:
-        raise ValueError(f"CTC target length mismatch: {total_expected} != {actual_size}")
+        raise ValueError(
+            f"CTC target length mismatch: {total_expected} != {actual_size}")
 
     return images_tensor, targets_tensor, text_lengths_tensor, texts, image_names
 
@@ -225,7 +226,7 @@ def train_epoch(model, dataloader, optimizer, device, use_sam=False):
 
     progress_bar = tqdm(dataloader, desc="Training")
 
-    for batch_idx, batch in enumerate(dataloader):
+    for batch_idx, batch in enumerate(progress_bar):
         images, targets, target_lengths, texts, image_names = batch
         images = images.to(device)
         targets = targets.to(device)
@@ -251,11 +252,12 @@ def train_epoch(model, dataloader, optimizer, device, use_sam=False):
                 # Standard training step
                 optimizer.zero_grad()
                 logits, loss = model(images, targets, target_lengths)
-                
+
                 loss.backward()
 
                 # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=1.0)
 
                 optimizer.step()
 
@@ -267,7 +269,7 @@ def train_epoch(model, dataloader, optimizer, device, use_sam=False):
 
             # Update progress bar
             progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
-            
+
         except Exception as e:
             print(f"Error in training batch: {e}")
             continue
@@ -287,7 +289,7 @@ def validate(model, dataloader, device, decoder):
 
     with torch.no_grad():
         # for batch in progress_bar:
-        for batch in dataloader:
+        for batch in progress_bar:
             images, targets, target_lengths, texts, image_names = batch
             images = images.to(device)
             targets = targets.to(device)
@@ -303,12 +305,17 @@ def validate(model, dataloader, device, decoder):
             num_batches += 1
 
             # Calculate character accuracy
+            # Extract individual sequences from concatenated targets
+            target_start = 0
             for i in range(logits.size(1)):  # batch dimension
                 pred_logits = logits[:, i, :]  # [seq_len, vocab_size]
                 predicted = decoder.greedy_decode(pred_logits)
 
-                # Get ground truth
-                target_seq = targets[i][:target_lengths[i]].cpu().numpy()
+                # Get ground truth sequence for this batch item
+                target_length = target_lengths[i].item()
+                target_end = target_start + target_length
+                target_seq = targets[target_start:target_end].cpu().numpy()
+                target_start = target_end
 
                 # Character-level accuracy
                 min_len = min(len(predicted), len(target_seq))
