@@ -198,9 +198,12 @@ def create_visualization(original_image, preprocessed_image, chunks, chunk_posit
     """Create comprehensive visualization with matplotlib"""
     num_chunks = len(chunks)
 
-    # Create figure
+    # Create merged visualization
+    merged_image, useful_regions = create_merged_visualization(preprocessed_image, chunk_positions)
+
+    # Create figure with one more row for merged image
     fig, axes = plt.subplots(
-        2 + num_chunks, 1, figsize=(16, 4 + num_chunks * 2.5))
+        3 + num_chunks, 1, figsize=(16, 6 + num_chunks * 2.5))
 
     if not isinstance(axes, (list, np.ndarray)):
         axes = [axes]
@@ -245,9 +248,44 @@ def create_visualization(original_image, preprocessed_image, chunks, chunk_posit
 
     axes[1].axis('off')
 
-    # 3. Individual chunks with overlays
+    # 3. Merged image (after applying merging logic)
+    if merged_image:
+        axes[2].imshow(merged_image)
+        
+        # Calculate total useful content
+        total_useful_width = sum(end - start for start, end in useful_regions)
+        efficiency = (total_useful_width / preprocessed_image.size[0]) * 100
+        
+        axes[2].set_title(f"After Merging: {merged_image.size[0]} × {merged_image.size[1]} pixels | "
+                         f"Useful Content: {total_useful_width}px ({efficiency:.1f}% efficiency) | "
+                         f"Removed: Padding + 40px from each overlap side",
+                         fontweight='bold', fontsize=12)
+        
+        # Highlight the useful regions on the merged image
+        for i, (region_start, region_end) in enumerate(useful_regions):
+            # Calculate position in merged image
+            region_offset = sum(useful_regions[j][1] - useful_regions[j][0] for j in range(i))
+            region_width = region_end - region_start
+            
+            # Draw boundary for each useful region
+            color = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink'][i % 7]
+            rect = patches.Rectangle((region_offset, 0), region_width, merged_image.size[1],
+                                   linewidth=2, edgecolor=color, facecolor='none', linestyle='-')
+            axes[2].add_patch(rect)
+            
+            # Add region label
+            axes[2].text(region_offset + 5, 10, f"R{i+1}", fontsize=10, fontweight='bold',
+                        bbox=dict(boxstyle="round,pad=0.2", facecolor='white', edgecolor=color))
+    else:
+        axes[2].text(0.5, 0.5, "No useful content after merging", 
+                    ha='center', va='center', transform=axes[2].transAxes, fontsize=12)
+        axes[2].set_title("After Merging: No Content", fontweight='bold', fontsize=12)
+    
+    axes[2].axis('off')
+
+    # 4. Individual chunks with overlays
     for i, chunk_tensor in enumerate(chunks):
-        if i + 2 >= len(axes):
+        if i + 3 >= len(axes):
             break
 
         # Convert tensor to PIL
@@ -260,7 +298,7 @@ def create_visualization(original_image, preprocessed_image, chunks, chunk_posit
             chunk_pil, i, num_chunks, chunk_positions)
 
         # Display
-        axes[i + 2].imshow(chunk_with_overlays)
+        axes[i + 3].imshow(chunk_with_overlays)
 
         # Create detailed title
         start, end, left_pad, _ = chunk_positions[i]
@@ -279,8 +317,8 @@ def create_visualization(original_image, preprocessed_image, chunks, chunk_posit
                  f"Ignored: L{ignored_left}px R{ignored_right}px | "
                  f"Useful: {useful_content}px")
 
-        axes[i + 2].set_title(title, fontsize=10)
-        axes[i + 2].axis('off')
+        axes[i + 3].set_title(title, fontsize=10)
+        axes[i + 3].axis('off')
 
         # Add color legend on the side
         # if i == 0:
@@ -294,7 +332,7 @@ def create_visualization(original_image, preprocessed_image, chunks, chunk_posit
         #         plt.Rectangle((0, 0), 1, 1, facecolor='white',
         #                       alpha=1, label='Useful content')
         #     ]
-        #     axes[i + 2].legend(handles=legend_elements,
+        #     axes[i + 3].legend(handles=legend_elements,
         #                        loc='center left', bbox_to_anchor=(1, 0.5))
 
     plt.tight_layout()
@@ -306,6 +344,68 @@ def create_visualization(original_image, preprocessed_image, chunks, chunk_posit
     plt.close()
 
     return viz_path
+
+
+def create_merged_visualization(preprocessed_image, chunk_positions):
+    """Create a visualization showing what the image looks like after merging (only useful content)"""
+    # Parameters
+    ignored_size = 40  # 40px ignored from each side of overlap
+
+    # Calculate useful regions for each chunk
+    useful_regions = []
+    for i, (start, end, left_pad, _) in enumerate(chunk_positions):
+        content_start = start
+        content_end = end
+
+        # Remove ignored regions based on merging logic
+        if len(chunk_positions) == 1:
+            # Single chunk - only remove left padding
+            if left_pad > 0:
+                content_start = start + left_pad
+        else:
+            if i == 0:
+                # First chunk - remove left padding and right ignored region
+                if left_pad > 0:
+                    content_start = start + left_pad
+                if i < len(chunk_positions) - 1:  # Not the last chunk
+                    content_end = end - ignored_size
+            elif i == len(chunk_positions) - 1:
+                # Last chunk - remove left ignored region
+                content_start = start + ignored_size
+            else:
+                # Middle chunk - remove ignored regions from both sides
+                content_start = start + ignored_size
+                content_end = end - ignored_size
+
+        # Only add if there's useful content
+        if content_end > content_start:
+            useful_regions.append((content_start, content_end))
+
+    # Create merged image by concatenating useful regions
+    merged_parts = []
+    for start, end in useful_regions:
+        # Extract the useful portion from preprocessed image
+        part = preprocessed_image.crop(
+            (start, 0, end, preprocessed_image.size[1]))
+        merged_parts.append(part)
+
+    if merged_parts:
+        # Calculate total width
+        total_width = sum(part.size[0] for part in merged_parts)
+        height = preprocessed_image.size[1]
+
+        # Create new merged image
+        merged_image = Image.new('RGB', (total_width, height), 'white')
+
+        # Paste all useful parts
+        x_offset = 0
+        for part in merged_parts:
+            merged_image.paste(part, (x_offset, 0))
+            x_offset += part.size[0]
+
+        return merged_image, useful_regions
+    else:
+        return None, useful_regions
 
 
 def visualize_image_chunking(image_path, output_dir="prototype"):
@@ -365,6 +465,27 @@ def visualize_image_chunking(image_path, output_dir="prototype"):
 
     except Exception as e:
         print(f"   ❌ Error creating visualization: {e}")
+
+    # Create merged image visualization
+    try:
+        merged_viz_path = os.path.join(
+            output_dir, f"{base_name}_merged_visualization.png")
+        merged_image, useful_regions = create_merged_visualization(
+            preprocessed_image, chunk_positions)
+
+        if merged_image:
+            merged_image.save(merged_viz_path)
+            print(f"   🖼️ Saved merged visualization: {Path(merged_viz_path).name}")
+
+            # Optionally, display the merged image with matplotlib
+            # plt.figure(figsize=(10, 5))
+            # plt.imshow(merged_image)
+            # plt.title("Merged Image Visualization")
+            # plt.axis('off')
+            # plt.show()
+
+    except Exception as e:
+        print(f"   ❌ Error creating merged visualization: {e}")
 
     # Print summary
     print(f"   📋 Summary:")

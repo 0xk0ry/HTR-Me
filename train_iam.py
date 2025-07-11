@@ -223,7 +223,8 @@ def train_epoch(model, dataloader, optimizer, device, use_sam=False):
 
     progress_bar = tqdm(dataloader, desc="Training")
 
-    for batch in progress_bar:
+    # for batch in progress_bar:
+    for batch in dataloader:
         images, targets, target_lengths, texts, image_names = batch
         images = images.to(device)
         targets = targets.to(device)
@@ -278,7 +279,8 @@ def validate(model, dataloader, device, decoder):
     progress_bar = tqdm(dataloader, desc="Validation")
 
     with torch.no_grad():
-        for batch in progress_bar:
+        # for batch in progress_bar:
+        for batch in dataloader:
             images, targets, target_lengths, texts, image_names = batch
             images = images.to(device)
             targets = targets.to(device)
