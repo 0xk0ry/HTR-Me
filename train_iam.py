@@ -7,6 +7,7 @@ from utils.sam import SAM
 from model.HTR_ME import HTRModel, CTCDecoder
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
@@ -288,47 +289,83 @@ def validate(model, dataloader, device, decoder):
     progress_bar = tqdm(dataloader, desc="Validation")
 
     with torch.no_grad():
-        # for batch in progress_bar:
-        for batch in progress_bar:
+        for batch_idx, batch in enumerate(progress_bar):
             images, targets, target_lengths, texts, image_names = batch
             images = images.to(device)
             targets = targets.to(device)
             target_lengths = target_lengths.to(device)
 
-            logits, loss = model(images, targets, target_lengths)
-            # Ensure loss is scalar and floating point
-            if loss.numel() > 1:
-                loss = loss.float().mean()
-            elif not loss.dtype.is_floating_point:
-                loss = loss.float()
-            total_loss += loss.item()
-            num_batches += 1
+            try:
+                # Get model output WITHOUT targets (inference mode)
+                logits, input_lengths = model(images)
+                
+                # Manually calculate CTC loss for validation
+                import torch.nn.functional as F
+                log_probs = F.log_softmax(logits, dim=-1)
+                loss = F.ctc_loss(
+                    log_probs, targets, input_lengths, target_lengths,
+                    blank=0, reduction='mean', zero_infinity=True
+                )
+                
+                # Ensure loss is scalar and floating point
+                if loss.numel() > 1:
+                    loss = loss.float().mean()
+                elif not loss.dtype.is_floating_point:
+                    loss = loss.float()
+                
+                # Skip if loss is invalid
+                if torch.isnan(loss) or torch.isinf(loss):
+                    continue
+                    
+                total_loss += loss.item()
+                num_batches += 1
 
-            # Calculate character accuracy
-            # Extract individual sequences from concatenated targets
-            target_start = 0
-            for i in range(logits.size(1)):  # batch dimension
-                pred_logits = logits[:, i, :]  # [seq_len, vocab_size]
-                predicted = decoder.greedy_decode(pred_logits)
+                # Calculate character accuracy
+                # Extract individual sequences from concatenated targets
+                target_start = 0
+                batch_size = images.size(0)
+                
+                for i in range(batch_size):
+                    # Get sequence length for this sample
+                    if i < len(input_lengths):
+                        seq_len = input_lengths[i].item()
+                        pred_logits = logits[:seq_len, i, :]  # [seq_len, vocab_size]
+                        predicted = decoder.greedy_decode(pred_logits)
 
-                # Get ground truth sequence for this batch item
-                target_length = target_lengths[i].item()
-                target_end = target_start + target_length
-                target_seq = targets[target_start:target_end].cpu().numpy()
-                target_start = target_end
+                        # Get ground truth sequence for this batch item
+                        target_length = target_lengths[i].item()
+                        target_end = target_start + target_length
+                        target_seq = targets[target_start:target_end].cpu().numpy()
+                        target_start = target_end
 
-                # Character-level accuracy
-                min_len = min(len(predicted), len(target_seq))
-                if min_len > 0:
-                    correct_chars += sum(1 for j in range(min_len)
-                                         if predicted[j] == target_seq[j])
-                total_chars += max(len(predicted), len(target_seq))
+                        # Character-level accuracy
+                        min_len = min(len(predicted), len(target_seq))
+                        if min_len > 0:
+                            correct_chars += sum(1 for j in range(min_len)
+                                               if predicted[j] == target_seq[j])
+                        total_chars += max(len(predicted), len(target_seq))
 
-            # Update progress bar
-            progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
+                # Update progress bar
+                progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
+
+                # Debug first batch
+                if batch_idx == 0:
+                    print(f"\nDEBUG - First validation batch:")
+                    print(f"  Images shape: {images.shape}")
+                    print(f"  Logits shape: {logits.shape}")
+                    print(f"  Input lengths: {input_lengths[:5] if len(input_lengths) > 5 else input_lengths}")
+                    print(f"  Target lengths: {target_lengths[:5] if len(target_lengths) > 5 else target_lengths}")
+                    print(f"  Targets shape: {targets.shape}")
+                    print(f"  Loss: {loss.item():.4f}")
+                    print(f"  Log probs range: [{log_probs.min().item():.3f}, {log_probs.max().item():.3f}]")
+                    
+            except Exception as e:
+                print(f"Error in validation batch {batch_idx}: {e}")
+                continue
 
     char_accuracy = correct_chars / total_chars if total_chars > 0 else 0
-    return total_loss / num_batches, char_accuracy
+    avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
+    return avg_loss, char_accuracy
 
 
 def main():
