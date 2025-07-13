@@ -340,20 +340,6 @@ def validate(model, dataloader, device, decoder):
                                                  if predicted[j] == target_seq[j])
                         total_chars += max(len(predicted), len(target_seq))
 
-                # Debug first batch
-                if batch_idx == 0:
-                    print(f"\nDEBUG - First validation batch:")
-                    print(f"  Images shape: {images.shape}")
-                    print(f"  Logits shape: {logits.shape}")
-                    print(
-                        f"  Input lengths: {input_lengths[:5] if len(input_lengths) > 5 else input_lengths}")
-                    print(
-                        f"  Target lengths: {target_lengths[:5] if len(target_lengths) > 5 else target_lengths}")
-                    print(f"  Targets shape: {targets.shape}")
-                    print(f"  Loss: {loss.item():.4f}")
-                    print(
-                        f"  Log probs range: [{log_probs.min().item():.3f}, {log_probs.max().item():.3f}]")
-
             except Exception as e:
                 print(f"Error in validation batch {batch_idx}: {e}")
                 continue
@@ -503,8 +489,7 @@ def main():
             weight_decay=args.weight_decay
         )
 
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs)
+    # No scheduler: keep learning rate constant
 
     # Create decoder
     decoder = CTCDecoder(train_dataset.vocab)
@@ -537,17 +522,15 @@ def main():
         val_loss, val_accuracy = validate(model, valid_loader, device, decoder)
         print(f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}")
 
-        # Update learning rate
-        scheduler.step()
-        current_lr = scheduler.get_last_lr()[0]
-        print(f"Learning Rate: {current_lr:.6f}")
+        # Learning rate stays constant
+        print(f"Learning Rate: {args.lr:.6f}")
 
         # Save checkpoint
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
+            # 'scheduler_state_dict': scheduler.state_dict(),  # removed
             'train_loss': train_loss,
             'val_loss': val_loss,
             'val_accuracy': val_accuracy,
