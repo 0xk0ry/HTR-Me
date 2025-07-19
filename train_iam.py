@@ -3,6 +3,8 @@ Training script for HTR model with IAM dataset
 Custom dataloader for image.png + image.txt pairs
 """
 
+from model.HTR_ME import HTRModel, CTCDecoder
+from utils.sam import SAM
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,8 +23,6 @@ import sys
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.sam import SAM
-from model.HTR_ME import HTRModel, CTCDecoder
 
 # Constants
 DEFAULT_TRANSFORMS = transforms.Compose([
@@ -59,15 +59,16 @@ class IAMDataset(Dataset):
         # Load vocabulary and samples
         self.vocab, self.char_to_idx = self._load_vocabulary()
         self.samples = self._load_samples()
-        
+
         print(f"Loaded {len(self.samples)} samples for {split} split")
         print(f"Vocabulary size: {len(self.vocab)} characters")
 
     def _load_vocabulary(self):
         """Load vocabulary from labels.pkl or create default"""
         labels_path = self.data_dir / 'labels.pkl'
-        
-        vocab = self._try_load_from_pickle(labels_path) or self._create_default_vocab()
+
+        vocab = self._try_load_from_pickle(
+            labels_path) or self._create_default_vocab()
         char_to_idx = {char: idx for idx, char in enumerate(vocab)}
         return vocab, char_to_idx
 
@@ -75,7 +76,7 @@ class IAMDataset(Dataset):
         """Try to load vocabulary from pickle file"""
         if not labels_path.exists():
             return None
-            
+
         try:
             with open(labels_path, 'rb') as f:
                 data = pickle.load(f)
@@ -96,7 +97,7 @@ class IAMDataset(Dataset):
         """Load all samples for the specified split"""
         pattern = f"{self.split}_*.png"
         image_files = list(self.data_dir.glob(pattern))
-        
+
         samples = []
         for img_path in image_files:
             txt_path = img_path.with_suffix('.txt')
@@ -145,7 +146,7 @@ class IAMDataset(Dataset):
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        
+
         # Load and process data
         image = self._load_image(sample['image_path'])
         text = self._load_text(sample['text_path'])
@@ -175,11 +176,13 @@ def collate_fn(batch):
 
     # Pad images to same width
     images_tensor = _pad_images(images)
-    
+
     # Create concatenated targets for CTC
-    targets_tensor, text_lengths_tensor = _prepare_ctc_targets(text_indices, text_lengths)
+    targets_tensor, text_lengths_tensor = _prepare_ctc_targets(
+        text_indices, text_lengths)
 
     return images_tensor, targets_tensor, text_lengths_tensor, texts, image_names
+
 
 def _pad_images(images):
     """Pad images to the same width"""
@@ -193,6 +196,7 @@ def _pad_images(images):
         padded_images.append(padded)
 
     return torch.stack(padded_images, 0)
+
 
 def _prepare_ctc_targets(text_indices, text_lengths):
     """Prepare targets for CTC loss"""
@@ -208,7 +212,8 @@ def _prepare_ctc_targets(text_indices, text_lengths):
     total_expected = sum(text_lengths)
     actual_size = len(concatenated_targets)
     if total_expected != actual_size:
-        raise ValueError(f"CTC target length mismatch: {total_expected} != {actual_size}")
+        raise ValueError(
+            f"CTC target length mismatch: {total_expected} != {actual_size}")
 
     return targets_tensor, text_lengths_tensor
 
@@ -221,12 +226,14 @@ def train_epoch(model, dataloader, optimizer, device, use_sam=False):
 
     for batch_idx, batch in enumerate(dataloader):
         try:
-            loss = _process_training_batch(batch, model, optimizer, device, use_sam)
-            
+            loss = _process_training_batch(
+                batch, model, optimizer, device, use_sam)
+
             if not _is_valid_loss(loss):
-                print(f"Warning: Invalid loss {loss.item()}, skipping batch {batch_idx}")
+                print(
+                    f"Warning: Invalid loss {loss.item()}, skipping batch {batch_idx}")
                 continue
-                
+
             total_loss += loss.item()
             num_batches += 1
 
@@ -236,15 +243,18 @@ def train_epoch(model, dataloader, optimizer, device, use_sam=False):
 
     return total_loss / num_batches if num_batches > 0 else float('inf')
 
+
 def _process_training_batch(batch, model, optimizer, device, use_sam):
     """Process a single training batch"""
     images, targets, target_lengths, texts, image_names = batch
-    images, targets, target_lengths = _move_to_device(images, targets, target_lengths, device)
+    images, targets, target_lengths = _move_to_device(
+        images, targets, target_lengths, device)
 
     if use_sam:
         return _sam_training_step(model, optimizer, images, targets, target_lengths)
     else:
         return _standard_training_step(model, optimizer, images, targets, target_lengths)
+
 
 def _move_to_device(images, targets, target_lengths, device):
     """Move tensors to device"""
@@ -253,6 +263,7 @@ def _move_to_device(images, targets, target_lengths, device):
         targets.to(device),
         target_lengths.to(device)
     )
+
 
 def _sam_training_step(model, optimizer, images, targets, target_lengths):
     """SAM training step"""
@@ -271,17 +282,19 @@ def _sam_training_step(model, optimizer, images, targets, target_lengths):
     optimizer.second_step(zero_grad=True)
     return loss
 
+
 def _standard_training_step(model, optimizer, images, targets, target_lengths):
     """Standard training step"""
     optimizer.zero_grad()
     logits, loss = model(images, targets, target_lengths)
     loss.backward()
-    
+
     # Gradient clipping
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
-    
+
     return loss
+
 
 def _is_valid_loss(loss):
     """Check if loss is valid (not NaN or Inf)"""
@@ -302,14 +315,16 @@ def validate(model, dataloader, device, decoder):
         for batch_idx, batch in enumerate(dataloader):
             try:
                 images, targets, target_lengths, texts, image_names = batch
-                images, targets, target_lengths = _move_to_device(images, targets, target_lengths, device)
+                images, targets, target_lengths = _move_to_device(
+                    images, targets, target_lengths, device)
 
                 # Get model output (inference mode)
                 logits, input_lengths = model(images)
 
                 # Calculate CTC loss
-                loss = _calculate_ctc_loss(logits, targets, input_lengths, target_lengths)
-                
+                loss = _calculate_ctc_loss(
+                    logits, targets, input_lengths, target_lengths)
+
                 if not _is_valid_loss(loss):
                     continue
 
@@ -331,6 +346,7 @@ def validate(model, dataloader, device, decoder):
     avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
     return avg_loss, char_accuracy
 
+
 def _calculate_ctc_loss(logits, targets, input_lengths, target_lengths):
     """Calculate CTC loss for validation"""
     log_probs = F.log_softmax(logits, dim=-1)
@@ -338,14 +354,15 @@ def _calculate_ctc_loss(logits, targets, input_lengths, target_lengths):
         log_probs, targets, input_lengths, target_lengths,
         blank=0, reduction='mean', zero_infinity=True
     )
-    
+
     # Ensure loss is scalar and floating point
     if loss.numel() > 1:
         loss = loss.float().mean()
     elif not loss.dtype.is_floating_point:
         loss = loss.float()
-        
+
     return loss
+
 
 def _calculate_batch_accuracy(logits, targets, target_lengths, input_lengths, decoder):
     """Calculate character accuracy for a batch"""
@@ -357,7 +374,7 @@ def _calculate_batch_accuracy(logits, targets, target_lengths, input_lengths, de
     for i in range(batch_size):
         if i >= len(input_lengths):
             break
-            
+
         # Get prediction
         seq_len = input_lengths[i].item()
         pred_logits = logits[:seq_len, i, :]  # [seq_len, vocab_size]
@@ -372,8 +389,8 @@ def _calculate_batch_accuracy(logits, targets, target_lengths, input_lengths, de
         # Calculate accuracy
         min_len = min(len(predicted), len(target_seq))
         if min_len > 0:
-            correct_chars += sum(1 for j in range(min_len) 
-                               if predicted[j] == target_seq[j])
+            correct_chars += sum(1 for j in range(min_len)
+                                 if predicted[j] == target_seq[j])
         total_chars += max(len(predicted), len(target_seq))
 
     return correct_chars, total_chars
@@ -393,12 +410,13 @@ def create_datasets(args):
         split='valid',
         target_height=args.target_height
     )
-    
+
     print(f"Train samples: {len(train_dataset)}")
     print(f"Valid samples: {len(valid_dataset)}")
     print(f"Vocabulary size: {len(train_dataset.vocab)}")
-    
+
     return train_dataset, valid_dataset
+
 
 def create_dataloaders(train_dataset, valid_dataset, args):
     """Create data loaders"""
@@ -419,8 +437,9 @@ def create_dataloaders(train_dataset, valid_dataset, args):
         num_workers=args.num_workers,
         pin_memory=True
     )
-    
+
     return train_loader, valid_loader
+
 
 def create_model(vocab_size, args):
     """Create HTR model"""
@@ -434,17 +453,18 @@ def create_model(vocab_size, args):
         num_heads=[1, 3, 6],
         depths=[1, 2, 10]
     )
-    
+
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {param_count:,}")
     return model
+
 
 def create_optimizer(model, args):
     """Create optimizer"""
     if args.use_sam:
         print(f"Using SAM optimizer with {args.base_optimizer} base")
         base_optimizer_class = OPTIMIZER_REGISTRY[args.base_optimizer]
-        
+
         optimizer = SAM(
             model.parameters(),
             base_optimizer_class,
@@ -458,8 +478,9 @@ def create_optimizer(model, args):
             lr=args.lr,
             weight_decay=args.weight_decay
         )
-    
+
     return optimizer
+
 
 def save_vocabulary(vocab, output_dir):
     """Save vocabulary to JSON file"""
@@ -467,6 +488,7 @@ def save_vocabulary(vocab, output_dir):
     with open(vocab_path, 'w') as f:
         json.dump(vocab, f, indent=2)
     print(f"Vocabulary saved to {vocab_path}")
+
 
 def load_checkpoint(model, optimizer, checkpoint_path, device):
     """Load checkpoint and return start epoch and best validation loss"""
@@ -478,8 +500,9 @@ def load_checkpoint(model, optimizer, checkpoint_path, device):
     best_val_loss = checkpoint.get('best_val_loss', float('inf'))
     return start_epoch, best_val_loss
 
-def save_checkpoint(model, optimizer, epoch, train_loss, val_loss, val_accuracy, 
-                   best_val_loss, vocab, args, output_dir, is_best=False):
+
+def save_checkpoint(model, optimizer, epoch, train_loss, val_loss, val_accuracy,
+                    best_val_loss, vocab, args, output_dir, is_best=False):
     """Save model checkpoint"""
     checkpoint = {
         'epoch': epoch,
@@ -496,11 +519,13 @@ def save_checkpoint(model, optimizer, epoch, train_loss, val_loss, val_accuracy,
     if is_best:
         torch.save(checkpoint, os.path.join(output_dir, 'best_model.pth'))
         print(f"🎉 New best model saved! Val Loss: {val_loss:.4f}")
-    
+
     # Save periodic checkpoint
     if (epoch + 1) % args.save_every == 0:
-        torch.save(checkpoint, os.path.join(output_dir, f'checkpoint_epoch_{epoch+1}.pth'))
+        torch.save(checkpoint, os.path.join(
+            output_dir, f'checkpoint_epoch_{epoch+1}.pth'))
         print(f"Checkpoint saved at epoch {epoch+1}")
+
 
 def training_loop(model, train_loader, valid_loader, optimizer, decoder, device, args, vocab):
     """Main training loop"""
@@ -509,7 +534,8 @@ def training_loop(model, train_loader, valid_loader, optimizer, decoder, device,
 
     # Resume from checkpoint if specified
     if args.resume:
-        start_epoch, best_val_loss = load_checkpoint(model, optimizer, args.resume, device)
+        start_epoch, best_val_loss = load_checkpoint(
+            model, optimizer, args.resume, device)
 
     print(f"Starting training for {args.epochs} epochs...")
 
@@ -518,7 +544,8 @@ def training_loop(model, train_loader, valid_loader, optimizer, decoder, device,
         print("-" * 50)
 
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, device, use_sam=args.use_sam)
+        train_loss = train_epoch(
+            model, train_loader, optimizer, device, use_sam=args.use_sam)
         print(f"Train Loss: {train_loss:.4f}")
 
         # Validate
@@ -530,7 +557,7 @@ def training_loop(model, train_loader, valid_loader, optimizer, decoder, device,
         is_best = val_loss < best_val_loss
         if is_best:
             best_val_loss = val_loss
-            
+
         save_checkpoint(
             model, optimizer, epoch, train_loss, val_loss, val_accuracy,
             best_val_loss, vocab, args, args.output_dir, is_best
@@ -541,7 +568,8 @@ def training_loop(model, train_loader, valid_loader, optimizer, decoder, device,
 
 def main():
     """Main training function"""
-    parser = argparse.ArgumentParser(description='Train HTR model on IAM dataset')
+    parser = argparse.ArgumentParser(
+        description='Train HTR model on IAM dataset')
 
     # Data arguments
     parser.add_argument('--data_dir', type=str, required=True,
@@ -550,26 +578,36 @@ def main():
                         help='Output directory for checkpoints')
 
     # Training arguments
-    parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
+    parser.add_argument('--epochs', type=int, default=100,
+                        help='Number of epochs')
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay')
+    parser.add_argument('--weight_decay', type=float,
+                        default=0.01, help='Weight decay')
 
     # Model arguments
-    parser.add_argument('--target_height', type=int, default=40, help='Target image height')
-    parser.add_argument('--chunk_width', type=int, default=320, help='Chunk width for processing')
-    parser.add_argument('--stride', type=int, default=240, help='Stride for chunking')
+    parser.add_argument('--target_height', type=int,
+                        default=40, help='Target image height')
+    parser.add_argument('--chunk_width', type=int,
+                        default=320, help='Chunk width for processing')
+    parser.add_argument('--stride', type=int, default=240,
+                        help='Stride for chunking')
 
     # Optimizer arguments
-    parser.add_argument('--use_sam', action='store_true', help='Use SAM optimizer')
-    parser.add_argument('--sam_rho', type=float, default=0.05, help='SAM rho parameter')
+    parser.add_argument('--use_sam', action='store_true',
+                        help='Use SAM optimizer')
+    parser.add_argument('--sam_rho', type=float,
+                        default=0.05, help='SAM rho parameter')
     parser.add_argument('--base_optimizer', type=str, default='adamw',
                         choices=['adamw', 'adam', 'sgd'], help='Base optimizer for SAM')
 
     # Other arguments
-    parser.add_argument('--resume', type=str, help='Resume training from checkpoint')
-    parser.add_argument('--save_every', type=int, default=5, help='Save checkpoint every N epochs')
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of data loading workers')
+    parser.add_argument('--resume', type=str,
+                        help='Resume training from checkpoint')
+    parser.add_argument('--save_every', type=int, default=5,
+                        help='Save checkpoint every N epochs')
+    parser.add_argument('--num_workers', type=int, default=4,
+                        help='Number of data loading workers')
 
     args = parser.parse_args()
 
@@ -580,21 +618,22 @@ def main():
 
     # Create datasets and data loaders
     train_dataset, valid_dataset = create_datasets(args)
-    train_loader, valid_loader = create_dataloaders(train_dataset, valid_dataset, args)
-    
+    train_loader, valid_loader = create_dataloaders(
+        train_dataset, valid_dataset, args)
+
     # Save vocabulary
     save_vocabulary(train_dataset.vocab, args.output_dir)
 
     # Create model, optimizer, and decoder
     model = create_model(len(train_dataset.vocab), args)
     model.to(device)
-    
+
     optimizer = create_optimizer(model, args)
     decoder = CTCDecoder(train_dataset.vocab)
 
     # Training
     best_val_loss = training_loop(
-        model, train_loader, valid_loader, optimizer, decoder, 
+        model, train_loader, valid_loader, optimizer, decoder,
         device, args, train_dataset.vocab
     )
 
