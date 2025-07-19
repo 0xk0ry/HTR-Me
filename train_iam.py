@@ -3,8 +3,6 @@ Training script for HTR model with IAM dataset
 Custom dataloader for image.png + image.txt pairs
 """
 
-from utils.sam import SAM
-from model.HTR_ME import HTRModel, CTCDecoder
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,87 +16,89 @@ import json
 import numpy as np
 from pathlib import Path
 import argparse
-from tqdm import tqdm
 import sys
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from utils.sam import SAM
+from model.HTR_ME import HTRModel, CTCDecoder
+
+# Constants
+DEFAULT_TRANSFORMS = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+DEFAULT_CHARSET = (
+    ' !"#$%&\'()*+,-./'
+    '0123456789'
+    ':;<=>?@'
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    '[\\]^_`'
+    'abcdefghijklmnopqrstuvwxyz'
+    '{|}~'
+)
+
+OPTIMIZER_REGISTRY = {
+    'adamw': optim.AdamW,
+    'adam': optim.Adam,
+    'sgd': optim.SGD
+}
+
 
 class IAMDataset(Dataset):
-    """
-    Custom dataset for IAM format with image.png and image.txt pairs
-    Supports train/valid/test splits
-    """
+    """Custom dataset for IAM format with image.png and image.txt pairs"""
 
     def __init__(self, data_dir, split='train', transform=None, target_height=40):
         self.data_dir = Path(data_dir)
         self.split = split
         self.target_height = target_height
+        self.transform = transform or DEFAULT_TRANSFORMS
 
-        # Load vocabulary
+        # Load vocabulary and samples
         self.vocab, self.char_to_idx = self._load_vocabulary()
-        print(f"Loaded vocabulary with {len(self.vocab)} characters")
-
-        # Get all image files for the split
         self.samples = self._load_samples()
+        
         print(f"Loaded {len(self.samples)} samples for {split} split")
-
-        # Set up transforms
-        if transform is None:
-            self.transform = transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-            ])
-        else:
-            self.transform = transform
+        print(f"Vocabulary size: {len(self.vocab)} characters")
 
     def _load_vocabulary(self):
         """Load vocabulary from labels.pkl or create default"""
         labels_path = self.data_dir / 'labels.pkl'
-
-        if labels_path.exists():
-            try:
-                with open(labels_path, 'rb') as f:
-                    data = pickle.load(f)
-                    charset = data.get('charset', [])
-                    vocab = ['<blank>'] + sorted(charset)
-                    print(f"Loaded vocabulary from {labels_path}")
-            except Exception as e:
-                print(f"Error loading {labels_path}: {e}")
-                vocab = self._create_default_vocab()
-        else:
-            vocab = self._create_default_vocab()
-
+        
+        vocab = self._try_load_from_pickle(labels_path) or self._create_default_vocab()
         char_to_idx = {char: idx for idx, char in enumerate(vocab)}
         return vocab, char_to_idx
+
+    def _try_load_from_pickle(self, labels_path):
+        """Try to load vocabulary from pickle file"""
+        if not labels_path.exists():
+            return None
+            
+        try:
+            with open(labels_path, 'rb') as f:
+                data = pickle.load(f)
+                charset = data.get('charset', [])
+                if charset:
+                    print(f"Loaded vocabulary from {labels_path}")
+                    return ['<blank>'] + sorted(charset)
+        except Exception as e:
+            print(f"Error loading {labels_path}: {e}")
+        return None
 
     def _create_default_vocab(self):
         """Create default vocabulary"""
         print("Creating default vocabulary...")
-        # Basic English characters, digits, and punctuation
-        chars = (
-            ' !"#$%&\'()*+,-./'
-            '0123456789'
-            ':;<=>?@'
-            'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-            '[\\]^_`'
-            'abcdefghijklmnopqrstuvwxyz'
-            '{|}~'
-        )
-        return ['<blank>'] + list(chars)
+        return ['<blank>'] + list(DEFAULT_CHARSET)
 
     def _load_samples(self):
         """Load all samples for the specified split"""
-        samples = []
-
-        # Find all image files for this split
         pattern = f"{self.split}_*.png"
         image_files = list(self.data_dir.glob(pattern))
-
+        
+        samples = []
         for img_path in image_files:
-            # Check if corresponding text file exists
             txt_path = img_path.with_suffix('.txt')
             if txt_path.exists():
                 samples.append({
@@ -112,50 +112,46 @@ class IAMDataset(Dataset):
         return sorted(samples, key=lambda x: x['image_name'])
 
     def _preprocess_image(self, image):
-        """Preprocess image to target height while preserving aspect ratio"""
+        """Resize image to target height while preserving aspect ratio"""
         w, h = image.size
-
-        # Calculate new width maintaining aspect ratio
         aspect_ratio = w / h
         new_width = int(self.target_height * aspect_ratio)
+        return image.resize((new_width, self.target_height), Image.LANCZOS)
 
-        # Resize image
-        image = image.resize((new_width, self.target_height), Image.LANCZOS)
-        return image
+    def _load_image(self, image_path):
+        """Load and preprocess image with error handling"""
+        try:
+            image = Image.open(image_path).convert('RGB')
+            return self._preprocess_image(image)
+        except Exception as e:
+            print(f"Error loading image {image_path}: {e}")
+            return Image.new('RGB', (100, self.target_height), color='white')
+
+    def _load_text(self, text_path):
+        """Load text with error handling"""
+        try:
+            with open(text_path, 'r', encoding='utf-8') as f:
+                return f.read().strip()
+        except Exception as e:
+            print(f"Error loading text {text_path}: {e}")
+            return ""
+
+    def _text_to_indices(self, text):
+        """Convert text to character indices"""
+        return [self.char_to_idx.get(char, 0) for char in text]
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
+        
+        # Load and process data
+        image = self._load_image(sample['image_path'])
+        text = self._load_text(sample['text_path'])
+        text_indices = self._text_to_indices(text)
 
-        # Load image
-        try:
-            image = Image.open(sample['image_path']).convert('RGB')
-            image = self._preprocess_image(image)
-        except Exception as e:
-            print(f"Error loading image {sample['image_path']}: {e}")
-            # Return a dummy image if loading fails
-            image = Image.new('RGB', (100, self.target_height), color='white')
-
-        # Load text
-        try:
-            with open(sample['text_path'], 'r', encoding='utf-8') as f:
-                text = f.read().strip()
-        except Exception as e:
-            print(f"Error loading text {sample['text_path']}: {e}")
-            text = ""
-
-        # Convert text to indices
-        text_indices = []
-        for char in text:
-            if char in self.char_to_idx:
-                text_indices.append(self.char_to_idx[char])
-            else:
-                # Handle unknown characters
-                text_indices.append(self.char_to_idx.get('<blank>', 0))
-
-        # Apply image transforms
+        # Apply transforms
         if self.transform:
             image = self.transform(image)
 
@@ -169,25 +165,24 @@ class IAMDataset(Dataset):
 
 
 def collate_fn(batch):
-    """
-    Custom collate function for variable length sequences
-    Handles batching of images and text sequences
-    """
-    images = []
-    text_indices = []
-    text_lengths = []
-    texts = []
-    image_names = []
-
-    for item in batch:
-        images.append(item['image'])
-        text_indices.append(item['text_indices'])
-        # Use the actual length of text_indices, not the stored text_length
-        text_lengths.append(len(item['text_indices']))
-        texts.append(item['text'])
-        image_names.append(item['image_name'])
+    """Custom collate function for variable length sequences"""
+    # Extract batch components
+    images = [item['image'] for item in batch]
+    text_indices = [item['text_indices'] for item in batch]
+    text_lengths = [len(item['text_indices']) for item in batch]
+    texts = [item['text'] for item in batch]
+    image_names = [item['image_name'] for item in batch]
 
     # Pad images to same width
+    images_tensor = _pad_images(images)
+    
+    # Create concatenated targets for CTC
+    targets_tensor, text_lengths_tensor = _prepare_ctc_targets(text_indices, text_lengths)
+
+    return images_tensor, targets_tensor, text_lengths_tensor, texts, image_names
+
+def _pad_images(images):
+    """Pad images to the same width"""
     max_width = max(img.size(2) for img in images)
     padded_images = []
 
@@ -197,84 +192,106 @@ def collate_fn(batch):
         padded[:, :, :w] = img
         padded_images.append(padded)
 
-    images_tensor = torch.stack(padded_images, 0)
+    return torch.stack(padded_images, 0)
 
-    # Convert text indices to a single concatenated tensor for CTC
-    # CTC expects targets as a 1D tensor with all sequences concatenated
+def _prepare_ctc_targets(text_indices, text_lengths):
+    """Prepare targets for CTC loss"""
+    # Concatenate all text sequences for CTC
     concatenated_targets = []
-
     for text in text_indices:
         concatenated_targets.extend(text)
 
     targets_tensor = torch.tensor(concatenated_targets, dtype=torch.long)
     text_lengths_tensor = torch.tensor(text_lengths, dtype=torch.long)
 
-    # Validation: Ensure sum of lengths matches total target tensor size
+    # Validate consistency
     total_expected = sum(text_lengths)
     actual_size = len(concatenated_targets)
     if total_expected != actual_size:
-        raise ValueError(
-            f"CTC target length mismatch: {total_expected} != {actual_size}")
+        raise ValueError(f"CTC target length mismatch: {total_expected} != {actual_size}")
 
-    return images_tensor, targets_tensor, text_lengths_tensor, texts, image_names
+    return targets_tensor, text_lengths_tensor
 
 
 def train_epoch(model, dataloader, optimizer, device, use_sam=False):
-    """Train for one epoch"""
+    """Train for one epoch with improved error handling"""
     model.train()
     total_loss = 0
     num_batches = 0
 
     for batch_idx, batch in enumerate(dataloader):
-        images, targets, target_lengths, texts, image_names = batch
-        images = images.to(device)
-        targets = targets.to(device)
-        target_lengths = target_lengths.to(device)
-
         try:
-            if use_sam:
-                # SAM training step
-                def closure():
-                    optimizer.zero_grad()
-                    logits, loss = model(images, targets, target_lengths)
-                    loss.backward()
-                    return loss
-
-                # First forward-backward pass
-                loss = closure()
-                optimizer.first_step(zero_grad=True)
-
-                # Second forward-backward pass
-                closure()
-                optimizer.second_step(zero_grad=True)
-            else:
-                # Standard training step
-                optimizer.zero_grad()
-                logits, loss = model(images, targets, target_lengths)
-
-                loss.backward()
-
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_norm=1.0)
-
-                optimizer.step()
-
-            # Ensure loss is floating point for item()
-            if not loss.dtype.is_floating_point:
-                loss = loss.float()
+            loss = _process_training_batch(batch, model, optimizer, device, use_sam)
+            
+            if not _is_valid_loss(loss):
+                print(f"Warning: Invalid loss {loss.item()}, skipping batch {batch_idx}")
+                continue
+                
             total_loss += loss.item()
             num_batches += 1
 
         except Exception as e:
-            print(f"Error in training batch: {e}")
+            print(f"Error in training batch {batch_idx}: {e}")
             continue
 
-    return total_loss / num_batches
+    return total_loss / num_batches if num_batches > 0 else float('inf')
+
+def _process_training_batch(batch, model, optimizer, device, use_sam):
+    """Process a single training batch"""
+    images, targets, target_lengths, texts, image_names = batch
+    images, targets, target_lengths = _move_to_device(images, targets, target_lengths, device)
+
+    if use_sam:
+        return _sam_training_step(model, optimizer, images, targets, target_lengths)
+    else:
+        return _standard_training_step(model, optimizer, images, targets, target_lengths)
+
+def _move_to_device(images, targets, target_lengths, device):
+    """Move tensors to device"""
+    return (
+        images.to(device),
+        targets.to(device),
+        target_lengths.to(device)
+    )
+
+def _sam_training_step(model, optimizer, images, targets, target_lengths):
+    """SAM training step"""
+    def closure():
+        optimizer.zero_grad()
+        logits, loss = model(images, targets, target_lengths)
+        loss.backward()
+        return loss
+
+    # First forward-backward pass
+    loss = closure()
+    optimizer.first_step(zero_grad=True)
+
+    # Second forward-backward pass
+    closure()
+    optimizer.second_step(zero_grad=True)
+    return loss
+
+def _standard_training_step(model, optimizer, images, targets, target_lengths):
+    """Standard training step"""
+    optimizer.zero_grad()
+    logits, loss = model(images, targets, target_lengths)
+    loss.backward()
+    
+    # Gradient clipping
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optimizer.step()
+    
+    return loss
+
+def _is_valid_loss(loss):
+    """Check if loss is valid (not NaN or Inf)"""
+    if not loss.dtype.is_floating_point:
+        loss = loss.float()
+    return not (torch.isnan(loss) or torch.isinf(loss))
 
 
 def validate(model, dataloader, device, decoder):
-    """Validate the model"""
+    """Validate the model with improved accuracy calculation"""
     model.eval()
     total_loss = 0
     num_batches = 0
@@ -283,62 +300,28 @@ def validate(model, dataloader, device, decoder):
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
-            images, targets, target_lengths, texts, image_names = batch
-            images = images.to(device)
-            targets = targets.to(device)
-            target_lengths = target_lengths.to(device)
-
             try:
-                # Get model output WITHOUT targets (inference mode)
+                images, targets, target_lengths, texts, image_names = batch
+                images, targets, target_lengths = _move_to_device(images, targets, target_lengths, device)
+
+                # Get model output (inference mode)
                 logits, input_lengths = model(images)
 
-                # Manually calculate CTC loss for validation
-                import torch.nn.functional as F
-                log_probs = F.log_softmax(logits, dim=-1)
-                loss = F.ctc_loss(
-                    log_probs, targets, input_lengths, target_lengths,
-                    blank=0, reduction='mean', zero_infinity=True
-                )
-
-                # Ensure loss is scalar and floating point
-                if loss.numel() > 1:
-                    loss = loss.float().mean()
-                elif not loss.dtype.is_floating_point:
-                    loss = loss.float()
-
-                # Skip if loss is invalid
-                if torch.isnan(loss) or torch.isinf(loss):
+                # Calculate CTC loss
+                loss = _calculate_ctc_loss(logits, targets, input_lengths, target_lengths)
+                
+                if not _is_valid_loss(loss):
                     continue
 
                 total_loss += loss.item()
                 num_batches += 1
 
                 # Calculate character accuracy
-                # Extract individual sequences from concatenated targets
-                target_start = 0
-                batch_size = images.size(0)
-
-                for i in range(batch_size):
-                    # Get sequence length for this sample
-                    if i < len(input_lengths):
-                        seq_len = input_lengths[i].item()
-                        # [seq_len, vocab_size]
-                        pred_logits = logits[:seq_len, i, :]
-                        predicted = decoder.greedy_decode(pred_logits)
-
-                        # Get ground truth sequence for this batch item
-                        target_length = target_lengths[i].item()
-                        target_end = target_start + target_length
-                        target_seq = targets[target_start:target_end].cpu(
-                        ).numpy()
-                        target_start = target_end
-
-                        # Character-level accuracy
-                        min_len = min(len(predicted), len(target_seq))
-                        if min_len > 0:
-                            correct_chars += sum(1 for j in range(min_len)
-                                                 if predicted[j] == target_seq[j])
-                        total_chars += max(len(predicted), len(target_seq))
+                batch_correct, batch_total = _calculate_batch_accuracy(
+                    logits, targets, target_lengths, input_lengths, decoder
+                )
+                correct_chars += batch_correct
+                total_chars += batch_total
 
             except Exception as e:
                 print(f"Error in validation batch {batch_idx}: {e}")
@@ -348,64 +331,56 @@ def validate(model, dataloader, device, decoder):
     avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
     return avg_loss, char_accuracy
 
+def _calculate_ctc_loss(logits, targets, input_lengths, target_lengths):
+    """Calculate CTC loss for validation"""
+    log_probs = F.log_softmax(logits, dim=-1)
+    loss = F.ctc_loss(
+        log_probs, targets, input_lengths, target_lengths,
+        blank=0, reduction='mean', zero_infinity=True
+    )
+    
+    # Ensure loss is scalar and floating point
+    if loss.numel() > 1:
+        loss = loss.float().mean()
+    elif not loss.dtype.is_floating_point:
+        loss = loss.float()
+        
+    return loss
 
-def main():
-    parser = argparse.ArgumentParser(
-        description='Train HTR model on IAM dataset')
+def _calculate_batch_accuracy(logits, targets, target_lengths, input_lengths, decoder):
+    """Calculate character accuracy for a batch"""
+    correct_chars = 0
+    total_chars = 0
+    target_start = 0
+    batch_size = logits.size(1)
 
-    # Data arguments
-    parser.add_argument('--data_dir', type=str, required=True,
-                        help='Path to IAM lines directory')
-    parser.add_argument('--output_dir', type=str, default='./checkpoints_iam',
-                        help='Output directory for checkpoints')
+    for i in range(batch_size):
+        if i >= len(input_lengths):
+            break
+            
+        # Get prediction
+        seq_len = input_lengths[i].item()
+        pred_logits = logits[:seq_len, i, :]  # [seq_len, vocab_size]
+        predicted = decoder.greedy_decode(pred_logits)
 
-    # Training arguments
-    parser.add_argument('--epochs', type=int, default=100,
-                        help='Number of epochs')
-    parser.add_argument('--batch_size', type=int, default=8,
-                        help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-4,
-                        help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0.01,
-                        help='Weight decay')
+        # Get ground truth
+        target_length = target_lengths[i].item()
+        target_end = target_start + target_length
+        target_seq = targets[target_start:target_end].cpu().numpy()
+        target_start = target_end
 
-    # Model arguments
-    parser.add_argument('--target_height', type=int, default=40,
-                        help='Target image height')
-    parser.add_argument('--chunk_width', type=int, default=320,
-                        help='Chunk width for processing')
-    parser.add_argument('--stride', type=int, default=240,
-                        help='Stride for chunking')
-    parser.add_argument('--padding', type=int, default=40,
-                        help='Padding for chunks')
+        # Calculate accuracy
+        min_len = min(len(predicted), len(target_seq))
+        if min_len > 0:
+            correct_chars += sum(1 for j in range(min_len) 
+                               if predicted[j] == target_seq[j])
+        total_chars += max(len(predicted), len(target_seq))
 
-    # Optimizer arguments
-    parser.add_argument('--use_sam', action='store_true',
-                        help='Use SAM optimizer')
-    parser.add_argument('--sam_rho', type=float, default=0.05,
-                        help='SAM rho parameter')
-    parser.add_argument('--base_optimizer', type=str, default='adamw',
-                        choices=['adamw', 'adam', 'sgd'],
-                        help='Base optimizer for SAM')
+    return correct_chars, total_chars
 
-    # Other arguments
-    parser.add_argument('--resume', type=str,
-                        help='Resume training from checkpoint')
-    parser.add_argument('--save_every', type=int, default=5,
-                        help='Save checkpoint every N epochs')
-    parser.add_argument('--num_workers', type=int, default=4,
-                        help='Number of data loading workers')
 
-    args = parser.parse_args()
-
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    # Device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-
-    # Create datasets
+def create_datasets(args):
+    """Create training and validation datasets"""
     print("Creating datasets...")
     train_dataset = IAMDataset(
         data_dir=args.data_dir,
@@ -418,8 +393,15 @@ def main():
         split='valid',
         target_height=args.target_height
     )
+    
+    print(f"Train samples: {len(train_dataset)}")
+    print(f"Valid samples: {len(valid_dataset)}")
+    print(f"Vocabulary size: {len(train_dataset.vocab)}")
+    
+    return train_dataset, valid_dataset
 
-    # Create data loaders
+def create_dataloaders(train_dataset, valid_dataset, args):
+    """Create data loaders"""
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -437,44 +419,32 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True
     )
+    
+    return train_loader, valid_loader
 
-    print(f"Train samples: {len(train_dataset)}")
-    print(f"Valid samples: {len(valid_dataset)}")
-    print(f"Vocabulary size: {len(train_dataset.vocab)}")
-
-    # Save vocabulary
-    vocab_path = os.path.join(args.output_dir, 'vocab.json')
-    with open(vocab_path, 'w') as f:
-        json.dump(train_dataset.vocab, f, indent=2)
-    print(f"Vocabulary saved to {vocab_path}")
-
-    # Create model
+def create_model(vocab_size, args):
+    """Create HTR model"""
     model = HTRModel(
-        vocab_size=len(train_dataset.vocab),
+        vocab_size=vocab_size,
         max_length=256,
         target_height=args.target_height,
         chunk_width=args.chunk_width,
         stride=args.stride,
-        padding=args.padding,
         embed_dims=[64, 192, 384],
         num_heads=[1, 3, 6],
         depths=[1, 2, 10]
     )
-
-    model.to(device)
+    
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {param_count:,}")
+    return model
 
-    # Create optimizer
+def create_optimizer(model, args):
+    """Create optimizer"""
     if args.use_sam:
         print(f"Using SAM optimizer with {args.base_optimizer} base")
-        base_optimizers = {
-            'adamw': optim.AdamW,
-            'adam': optim.Adam,
-            'sgd': optim.SGD
-        }
-        base_optimizer_class = base_optimizers[args.base_optimizer]
-
+        base_optimizer_class = OPTIMIZER_REGISTRY[args.base_optimizer]
+        
         optimizer = SAM(
             model.parameters(),
             base_optimizer_class,
@@ -488,25 +458,59 @@ def main():
             lr=args.lr,
             weight_decay=args.weight_decay
         )
+    
+    return optimizer
 
-    # No scheduler: keep learning rate constant
+def save_vocabulary(vocab, output_dir):
+    """Save vocabulary to JSON file"""
+    vocab_path = os.path.join(output_dir, 'vocab.json')
+    with open(vocab_path, 'w') as f:
+        json.dump(vocab, f, indent=2)
+    print(f"Vocabulary saved to {vocab_path}")
 
-    # Create decoder
-    decoder = CTCDecoder(train_dataset.vocab)
+def load_checkpoint(model, optimizer, checkpoint_path, device):
+    """Load checkpoint and return start epoch and best validation loss"""
+    print(f"Resuming from {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    start_epoch = checkpoint['epoch'] + 1
+    best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+    return start_epoch, best_val_loss
 
-    # Resume from checkpoint if specified
+def save_checkpoint(model, optimizer, epoch, train_loss, val_loss, val_accuracy, 
+                   best_val_loss, vocab, args, output_dir, is_best=False):
+    """Save model checkpoint"""
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'train_loss': train_loss,
+        'val_loss': val_loss,
+        'val_accuracy': val_accuracy,
+        'best_val_loss': best_val_loss,
+        'vocab': vocab,
+        'args': vars(args)
+    }
+
+    if is_best:
+        torch.save(checkpoint, os.path.join(output_dir, 'best_model.pth'))
+        print(f"🎉 New best model saved! Val Loss: {val_loss:.4f}")
+    
+    # Save periodic checkpoint
+    if (epoch + 1) % args.save_every == 0:
+        torch.save(checkpoint, os.path.join(output_dir, f'checkpoint_epoch_{epoch+1}.pth'))
+        print(f"Checkpoint saved at epoch {epoch+1}")
+
+def training_loop(model, train_loader, valid_loader, optimizer, decoder, device, args, vocab):
+    """Main training loop"""
     start_epoch = 0
     best_val_loss = float('inf')
 
+    # Resume from checkpoint if specified
     if args.resume:
-        print(f"Resuming from {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        start_epoch, best_val_loss = load_checkpoint(model, optimizer, args.resume, device)
 
-    # Training loop
     print(f"Starting training for {args.epochs} epochs...")
 
     for epoch in range(start_epoch, args.epochs):
@@ -514,44 +518,85 @@ def main():
         print("-" * 50)
 
         # Train
-        train_loss = train_epoch(
-            model, train_loader, optimizer, device, use_sam=args.use_sam)
+        train_loss = train_epoch(model, train_loader, optimizer, device, use_sam=args.use_sam)
         print(f"Train Loss: {train_loss:.4f}")
 
         # Validate
         val_loss, val_accuracy = validate(model, valid_loader, device, decoder)
         print(f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}")
-
-        # Learning rate stays constant
         print(f"Learning Rate: {args.lr:.6f}")
 
         # Save checkpoint
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            # 'scheduler_state_dict': scheduler.state_dict(),  # removed
-            'train_loss': train_loss,
-            'val_loss': val_loss,
-            'val_accuracy': val_accuracy,
-            'best_val_loss': best_val_loss,
-            'vocab': train_dataset.vocab,
-            'args': vars(args)
-        }
-
-        # Save best model
-        if val_loss < best_val_loss:
+        is_best = val_loss < best_val_loss
+        if is_best:
             best_val_loss = val_loss
-            checkpoint['best_val_loss'] = best_val_loss
-            torch.save(checkpoint, os.path.join(
-                args.output_dir, 'best_model.pth'))
-            print(f"🎉 New best model saved! Val Loss: {val_loss:.4f}")
+            
+        save_checkpoint(
+            model, optimizer, epoch, train_loss, val_loss, val_accuracy,
+            best_val_loss, vocab, args, args.output_dir, is_best
+        )
 
-        # Save periodic checkpoint
-        if (epoch + 1) % args.save_every == 0:
-            torch.save(checkpoint, os.path.join(
-                args.output_dir, f'checkpoint_epoch_{epoch+1}.pth'))
-            print(f"Checkpoint saved at epoch {epoch+1}")
+    return best_val_loss
+
+
+def main():
+    """Main training function"""
+    parser = argparse.ArgumentParser(description='Train HTR model on IAM dataset')
+
+    # Data arguments
+    parser.add_argument('--data_dir', type=str, required=True,
+                        help='Path to IAM lines directory')
+    parser.add_argument('--output_dir', type=str, default='./checkpoints_iam',
+                        help='Output directory for checkpoints')
+
+    # Training arguments
+    parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
+    parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay')
+
+    # Model arguments
+    parser.add_argument('--target_height', type=int, default=40, help='Target image height')
+    parser.add_argument('--chunk_width', type=int, default=320, help='Chunk width for processing')
+    parser.add_argument('--stride', type=int, default=240, help='Stride for chunking')
+
+    # Optimizer arguments
+    parser.add_argument('--use_sam', action='store_true', help='Use SAM optimizer')
+    parser.add_argument('--sam_rho', type=float, default=0.05, help='SAM rho parameter')
+    parser.add_argument('--base_optimizer', type=str, default='adamw',
+                        choices=['adamw', 'adam', 'sgd'], help='Base optimizer for SAM')
+
+    # Other arguments
+    parser.add_argument('--resume', type=str, help='Resume training from checkpoint')
+    parser.add_argument('--save_every', type=int, default=5, help='Save checkpoint every N epochs')
+    parser.add_argument('--num_workers', type=int, default=4, help='Number of data loading workers')
+
+    args = parser.parse_args()
+
+    # Setup
+    os.makedirs(args.output_dir, exist_ok=True)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    # Create datasets and data loaders
+    train_dataset, valid_dataset = create_datasets(args)
+    train_loader, valid_loader = create_dataloaders(train_dataset, valid_dataset, args)
+    
+    # Save vocabulary
+    save_vocabulary(train_dataset.vocab, args.output_dir)
+
+    # Create model, optimizer, and decoder
+    model = create_model(len(train_dataset.vocab), args)
+    model.to(device)
+    
+    optimizer = create_optimizer(model, args)
+    decoder = CTCDecoder(train_dataset.vocab)
+
+    # Training
+    best_val_loss = training_loop(
+        model, train_loader, valid_loader, optimizer, decoder, 
+        device, args, train_dataset.vocab
+    )
 
     print("\n🎉 Training completed!")
     print(f"Best validation loss: {best_val_loss:.4f}")
