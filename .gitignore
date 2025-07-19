@@ -1,6 +1,5 @@
 *.tgz
 data/iam/xml
 data/iam/lines
-__pycache__
-*.pyc
+__pycache__/
 prototype/

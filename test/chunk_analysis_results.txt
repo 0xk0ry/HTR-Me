@@ -1,0 +1,34 @@
+HTR Model Chunking Analysis Results
+==================================================
+
+Chunk Positions: [(0, 280, 40, 320), (200, 520, 0, 320), (440, 760, 0, 320), (680, 800, 0, 120)]
+Valid Indices: [(10, 69.0, 79), (10.0, 69.0, 79), (10.0, 69.0, 79), (10.0, 29, 79)]
+Merged Features Shape: torch.Size([196, 384])
+Final Logits Shape: torch.Size([196, 1, 100])
+Sequence Lengths: tensor([196])
+
+Detailed Chunk Analysis:
+
+Chunk 0:
+  Pixel range: 0-280
+  Left padding: 40px
+  Features shape: torch.Size([79, 384])
+  Valid indices: (10, 69.0, 79)
+
+Chunk 1:
+  Pixel range: 200-520
+  Left padding: 0px
+  Features shape: torch.Size([79, 384])
+  Valid indices: (10.0, 69.0, 79)
+
+Chunk 2:
+  Pixel range: 440-760
+  Left padding: 0px
+  Features shape: torch.Size([79, 384])
+  Valid indices: (10.0, 69.0, 79)
+
+Chunk 3:
+  Pixel range: 680-800
+  Left padding: 0px
+  Features shape: torch.Size([79, 384])
+  Valid indices: (10.0, 29, 79)

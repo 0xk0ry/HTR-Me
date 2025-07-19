@@ -22,6 +22,20 @@ except ImportError:
     KENLM_AVAILABLE = False
     print("Warning: KenLM and pyctcdecode not available. Install with: pip install kenlm pyctcdecode")
 
+# Constants
+DEFAULT_VOCAB = ['<blank>'] + \
+    list('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,!?;: ')
+DEFAULT_NORMALIZATION = {
+    'mean': [0.485, 0.456, 0.406],
+    'std': [0.229, 0.224, 0.225]
+}
+DEFAULT_CVT_CONFIG = {
+    'patch_sizes': [7, 3, 3],
+    'strides': [4, 2, 2],
+    'kernel_sizes': [3, 3, 3],
+    'mlp_ratios': [4, 4, 4]
+}
+
 # CvT (Convolutional Vision Transformer) Implementation
 
 
@@ -200,69 +214,117 @@ class CvT(nn.Module):
 class ImageChunker:
     """Handles image chunking with overlapping and padding"""
 
-    def __init__(self, target_height=40, chunk_width=320, stride=240, padding=40):
+    def __init__(self, target_height=40, chunk_width=320, stride=240):
         self.target_height = target_height
         self.chunk_width = chunk_width
         self.stride = stride
-        self.padding = padding
+        self.padding = int((chunk_width - stride) / 2)
 
     def preprocess_image(self, image):
         """Resize image to target height while preserving aspect ratio"""
+        # Get dimensions based on image type
         if isinstance(image, np.ndarray):
             h, w = image.shape[:2]
+            is_numpy = True
         else:  # PIL Image
             w, h = image.size
+            is_numpy = False
 
-        # Calculate new width maintaining aspect ratio
+        # Calculate new dimensions
         aspect_ratio = w / h
         new_width = int(self.target_height * aspect_ratio)
+        new_size = (new_width, self.target_height)
 
-        if isinstance(image, np.ndarray):
-            if CV2_AVAILABLE:
-                image = cv2.resize(image, (new_width, self.target_height))
-                if len(image.shape) == 3:
-                    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            else:
-                # Fallback to PIL
-                image = Image.fromarray(image)
-                image = image.resize(
-                    (new_width, self.target_height), Image.LANCZOS)
+        # Resize based on available libraries and image type
+        if is_numpy and CV2_AVAILABLE:
+            image = cv2.resize(image, new_size)
+            if len(image.shape) == 3:
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         else:
-            image = image.resize(
-                (new_width, self.target_height), Image.LANCZOS)
+            # Convert to PIL and resize
+            if is_numpy:
+                image = Image.fromarray(image)
+            image = image.resize(new_size, Image.LANCZOS)
 
         return image
 
     def create_chunks(self, image):
         """Create overlapping chunks with grey padding for first and last chunks"""
         # Convert to tensor if needed
-        if isinstance(image, (np.ndarray, Image.Image)):
-            transform = transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[
-                                     0.229, 0.224, 0.225])
-            ])
-            if isinstance(image, np.ndarray):
-                image = Image.fromarray(image)
-            image_tensor = transform(image)
-        else:
-            image_tensor = image
-
+        image_tensor = self._convert_to_tensor(image)
         C, H, W = image_tensor.shape
 
         chunks = []
         chunk_positions = []
-
-        # Calculate overlap size
         overlap_size = self.chunk_width - self.stride  # 320 - 240 = 80px
 
         if W <= self.chunk_width - self.padding:
             # Single chunk case
-            # Add left padding (40px grey)
-            chunk = F.pad(image_tensor, (self.padding, 0, 0, 0),
+            chunk, position = self._create_single_chunk(image_tensor, W)
+            chunks.append(chunk)
+            chunk_positions.append(position)
+        else:
+            # Multiple chunks case
+            chunks, chunk_positions = self._create_multiple_chunks(
+                image_tensor, W, overlap_size)
+
+        return torch.cat(chunks, dim=0), chunk_positions
+
+    def _convert_to_tensor(self, image):
+        """Convert image to normalized tensor"""
+        if isinstance(image, (np.ndarray, Image.Image)):
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(**DEFAULT_NORMALIZATION)
+            ])
+            if isinstance(image, np.ndarray):
+                image = Image.fromarray(image)
+            return transform(image)
+        return image
+
+    def _create_single_chunk(self, image_tensor, W):
+        """Create a single chunk with padding"""
+        # Add left padding
+        chunk = F.pad(image_tensor, (self.padding, 0, 0, 0),
+                      mode='constant', value=0.5)
+
+        # Add right padding if needed
+        current_width = chunk.size(2)
+        if current_width < self.chunk_width:
+            right_pad = self.chunk_width - current_width
+            chunk = F.pad(chunk, (0, right_pad, 0, 0),
                           mode='constant', value=0.5)
 
-            # Add right padding if needed to reach chunk_width
+        position = (0, W, self.padding, self.padding + W)
+        return chunk.unsqueeze(0), position
+
+    def _create_multiple_chunks(self, image_tensor, W, overlap_size):
+        """Create multiple overlapping chunks"""
+        chunks = []
+        chunk_positions = []
+        start = 0
+        chunk_idx = 0
+
+        while start < W:
+            is_first_chunk = (chunk_idx == 0)
+
+            # Calculate chunk end position
+            if is_first_chunk:
+                content_width = self.chunk_width - self.padding  # 320 - 40 = 280px
+                end = min(start + content_width, W)
+            else:
+                end = min(start + self.chunk_width, W)
+
+            # Create chunk
+            chunk = image_tensor[:, :, start:end]
+            chunk_width = end - start
+
+            # Add padding
+            if is_first_chunk:
+                chunk = F.pad(chunk, (self.padding, 0, 0, 0),
+                              mode='constant', value=0.5)
+
+            # Add right padding for last chunk if needed
             current_width = chunk.size(2)
             if current_width < self.chunk_width:
                 right_pad = self.chunk_width - current_width
@@ -270,88 +332,43 @@ class ImageChunker:
                               mode='constant', value=0.5)
 
             chunks.append(chunk.unsqueeze(0))
-            chunk_positions.append((0, W, self.padding, self.padding + W))
-        else:
-            # Multiple chunks case
-            start = 0
-            chunk_idx = 0
 
-            while start < W:
-                is_first_chunk = (chunk_idx == 0)
+            # Store position info
+            left_pad = self.padding if is_first_chunk else 0
+            chunk_positions.append(
+                (start, end, left_pad, left_pad + chunk_width))
 
-                if is_first_chunk:
-                    # First chunk: content from 0 to (chunk_width - padding)
-                    # This leaves room for the 40px left padding
-                    content_width = self.chunk_width - self.padding  # 320 - 40 = 280px
-                    end = min(start + content_width, W)
-                else:
-                    # Subsequent chunks: normal chunk_width
-                    end = min(start + self.chunk_width, W)
+            if end >= W:
+                break
 
-                # Extract chunk content
-                chunk = image_tensor[:, :, start:end]
-                chunk_width = end - start
+            # Next start maintains overlap
+            start = end - overlap_size
+            chunk_idx += 1
 
-                # Add left padding for first chunk
-                if is_first_chunk:
-                    chunk = F.pad(chunk, (self.padding, 0, 0, 0),
-                                  mode='constant', value=0.5)
-
-                # Add right padding for last chunk if needed
-                current_width = chunk.size(2)
-                if current_width < self.chunk_width:
-                    right_pad = self.chunk_width - current_width
-                    chunk = F.pad(chunk, (0, right_pad, 0, 0),
-                                  mode='constant', value=0.5)
-
-                chunks.append(chunk.unsqueeze(0))
-
-                # Store position info: (start, end, left_pad, content_end_in_chunk)
-                left_pad = self.padding if is_first_chunk else 0
-                chunk_positions.append(
-                    (start, end, left_pad, left_pad + chunk_width))
-
-                if end >= W:
-                    break
-
-                if is_first_chunk:
-                    # For first chunk, next start maintains overlap
-                    # First chunk covers 0-280, next should start at 280-80=200
-                    start = end - overlap_size  # 280 - 80 = 200
-                else:
-                    # For subsequent chunks, use stride with overlap
-                    start += self.stride  # Maintains 80px overlap
-
-                chunk_idx += 1
-
-        return torch.cat(chunks, dim=0), chunk_positions
+        return chunks, chunk_positions
 
 
 class HTRModel(nn.Module):
     """Handwritten Text Recognition Model with CvT backbone"""
 
     def __init__(self, vocab_size, max_length=256, target_height=40, chunk_width=320,
-                 stride=240, padding=40, embed_dims=[64, 192, 384], num_heads=[1, 3, 6],
+                 stride=240, embed_dims=[64, 192, 384], num_heads=[1, 3, 6],
                  depths=[1, 2, 10]):
         super().__init__()
 
         self.vocab_size = vocab_size
         self.max_length = max_length
         self.chunker = ImageChunker(
-            target_height, chunk_width, stride, padding)
+            target_height, chunk_width, stride)
 
         # CvT backbone for feature extraction
-        # All chunks will be exactly chunk_width (320px) wide
         self.cvt = CvT(
-            img_size=chunk_width,  # 320px
+            img_size=chunk_width,
             in_chans=3,
             embed_dims=embed_dims,
             num_heads=num_heads,
             depths=depths,
-            patch_sizes=[7, 3, 3],
-            strides=[4, 2, 2],
-            kernel_sizes=[3, 3, 3],
-            mlp_ratios=[4, 4, 4],
+            **DEFAULT_CVT_CONFIG,
             qkv_bias=True,
             drop_rate=0.1,
             attn_drop_rate=0.1
@@ -509,104 +526,75 @@ class HTRModel(nn.Module):
         return features
 
     def _merge_chunk_features(self, chunk_features, chunk_positions):
-        """Merge features from multiple chunks, removing padded and ignored regions during merging
-
-        FIXED ISSUES:
-        - Consistent pixel-to-patch conversion using stride
-        - Proper overlap handling with averaging instead of just cropping
-        - Tensor contiguity ensured after slicing
-        - Better edge case handling for padding calculations
-        """
+        """Merge features from multiple chunks, removing padded and ignored regions during merging"""
         if not chunk_features:
             return torch.empty(0, self.feature_dim, device='cpu').contiguous()
 
         device = chunk_features[0].device
-        merged_features = []
-        ignored_size = 40  # 40px ignored from each side of overlap during merging
-
-        # Get patch stride for converting pixel positions to patch indices
         patch_stride = self.cvt.patch_embed.stride
+        ignore_patches = max(1, self.chunker.padding // patch_stride)
 
-        # Convert ignore size from pixels to patches (with proper rounding)
-        # Ensure at least 1 patch ignored
-        ignore_patches = max(1, ignored_size // patch_stride)
+        merged_features = []
 
-        # FIXED: Ensure all pixel-to-patch conversions are consistent
-        for i, (features, (start_px, end_px, left_pad_px, content_end_in_chunk_px)) in enumerate(zip(chunk_features, chunk_positions)):
-            # features shape: [W', C] where W' is number of patches along width
+        for i, (features, pos_info) in enumerate(zip(chunk_features, chunk_positions)):
+            start_px, end_px, left_pad_px, _ = pos_info
             total_patches = features.size(0)
 
-            if len(chunk_positions) == 1:
-                # Single chunk - remove left padding only
-                if left_pad_px > 0:
-                    # Convert padding pixels to patch indices
-                    padding_patches = left_pad_px // patch_stride
-                    padding_patches = min(
-                        padding_patches, total_patches - 1)  # Safety clamp
-                    valid_features = features[padding_patches:].contiguous()
-                else:
-                    valid_features = features.contiguous()
+            # Calculate valid feature range based on chunk type
+            start_idx, end_idx = self._calculate_chunk_bounds(
+                i, len(chunk_positions), total_patches, left_pad_px,
+                end_px - start_px, patch_stride, ignore_patches
+            )
+
+            # Extract valid features if range is valid
+            if start_idx < end_idx and end_idx <= total_patches:
+                valid_features = features[start_idx:end_idx].contiguous()
+                if valid_features.size(0) > 0:
+                    merged_features.append(valid_features)
+
+        return torch.cat(merged_features, dim=0).contiguous() if merged_features else torch.empty(0, self.feature_dim, device=device).contiguous()
+
+    def _calculate_chunk_bounds(self, chunk_idx, total_chunks, total_patches, left_pad_px, chunk_width_px, patch_stride, ignore_patches):
+        """Calculate start and end indices for valid features in a chunk"""
+        start_idx = 0
+        end_idx = total_patches
+
+        if total_chunks == 1:
+            # Single chunk: remove padding from both sides
+            if left_pad_px > 0:
+                start_idx = min(left_pad_px // patch_stride, total_patches - 1)
+
+            # Calculate actual content ratio for right padding removal
+            if chunk_width_px < self.chunker.chunk_width - left_pad_px:
+                content_ratio = (left_pad_px + chunk_width_px) / \
+                    self.chunker.chunk_width
+                end_idx = min(
+                    max(1, int(content_ratio * total_patches)), total_patches)
+
+        elif chunk_idx == 0:
+            # First chunk: remove left padding and right ignore region
+            if left_pad_px > 0:
+                start_idx = min(left_pad_px // patch_stride, total_patches - 1)
+            end_idx = max(start_idx + 1, total_patches - ignore_patches)
+
+        elif chunk_idx == total_chunks - 1:
+            # Last chunk: remove left ignore region and handle right padding
+            if chunk_width_px < self.chunker.chunk_width:
+                # Chunk has right padding
+                content_ratio = chunk_width_px / self.chunker.chunk_width
+                actual_patches = max(1, int(content_ratio * total_patches))
+                start_idx = min(ignore_patches, actual_patches - 1)
+                end_idx = actual_patches
             else:
-                if i == 0:
-                    # First chunk - remove left padding and ignored region on right
-                    start_idx = 0
-                    if left_pad_px > 0:
-                        # Convert padding pixels to patch indices
-                        padding_patches = left_pad_px // patch_stride
-                        padding_patches = min(
-                            padding_patches, total_patches - 1)  # Safety clamp
-                        start_idx = padding_patches
+                # No right padding
+                start_idx = min(ignore_patches, total_patches - 1)
 
-                    # Remove ignored region from right
-                    if i < len(chunk_positions) - 1:  # Not the last chunk
-                        # Ensure valid range
-                        end_idx = max(
-                            start_idx + 1, total_patches - ignore_patches)
-                    else:
-                        end_idx = total_patches
-
-                    valid_features = features[start_idx:end_idx].contiguous()
-
-                elif i == len(chunk_positions) - 1:
-                    # Last chunk - remove ignored region from left
-                    chunk_actual_width_px = end_px - start_px
-
-                    # FIXED: More robust calculation for last chunk
-                    if chunk_actual_width_px < self.chunker.chunk_width:
-                        # This chunk was padded on the right
-                        # Calculate actual content patches more precisely
-                        content_ratio = chunk_actual_width_px / self.chunker.chunk_width
-                        chunk_actual_patches = max(
-                            1, int(content_ratio * total_patches))
-
-                        # Remove ignored region from the beginning
-                        start_idx = min(
-                            ignore_patches, chunk_actual_patches - 1)
-                        valid_features = features[start_idx:chunk_actual_patches].contiguous(
-                        )
-                    else:
-                        # No right padding, just remove ignored region from left
-                        start_idx = min(ignore_patches, total_patches - 1)
-                        valid_features = features[start_idx:].contiguous()
-
-                else:
-                    # Middle chunk - remove ignored regions from both sides
-                    # Safety bounds
-                    start_idx = min(ignore_patches, total_patches // 2)
-                    end_idx = max(
-                        start_idx + 1, total_patches - ignore_patches)
-                    valid_features = features[start_idx:end_idx].contiguous()
-
-            # Only add non-empty features
-            if valid_features.size(0) > 0:
-                merged_features.append(valid_features)
-
-        # Concatenate all valid features
-        if merged_features:
-            result = torch.cat(merged_features, dim=0)  # [T_total, C]
-            return result.contiguous()
         else:
-            return torch.empty(0, self.feature_dim, device=device).contiguous()
+            # Middle chunk: remove ignore regions from both sides
+            start_idx = min(ignore_patches, total_patches // 2)
+            end_idx = max(start_idx + 1, total_patches - ignore_patches)
+
+        return start_idx, end_idx
 
 
 class CTCDecoder:
@@ -664,7 +652,7 @@ class CTCDecoder:
         seq_len, vocab_size = logits.shape
         log_probs = F.log_softmax(logits, dim=-1)
 
-        # Initialize beam
+        # Initialize beam with empty sequence
         beams = [([], 0.0)]  # (sequence, log_prob)
 
         for t in range(seq_len):
@@ -673,85 +661,47 @@ class CTCDecoder:
             for sequence, log_prob in beams:
                 for c in range(vocab_size):
                     new_log_prob = log_prob + log_probs[t, c].item()
-
-                    if c == self.blank_id:
-                        # Blank token - don't extend sequence
-                        new_sequence = sequence
-                    elif len(sequence) > 0 and sequence[-1] == c:
-                        # Same character as previous - don't extend
-                        new_sequence = sequence
-                    else:
-                        # New character
-                        new_sequence = sequence + [c]
-
+                    new_sequence = self._update_sequence(sequence, c)
                     new_beams.append((new_sequence, new_log_prob))
 
             # Keep top beam_width beams
             new_beams.sort(key=lambda x: x[1], reverse=True)
             beams = new_beams[:beam_width]
 
-        # Return best sequence
+        # Return best sequence as text
         best_sequence = beams[0][0]
         return ''.join([self.vocab[i] for i in best_sequence if i < len(self.vocab)])
+
+    def _update_sequence(self, sequence, char_id):
+        """Update sequence according to CTC rules"""
+        if char_id == self.blank_id:
+            # Blank token - don't extend sequence
+            return sequence
+        elif len(sequence) > 0 and sequence[-1] == char_id:
+            # Same character as previous - don't extend
+            return sequence
+        else:
+            # New character
+            return sequence + [char_id]
 
 # Training utilities
 
 
 def train_epoch(model, dataloader, optimizer, device, vocab, use_sam=False):
-    """Train for one epoch
-
-    FIXED ISSUES:
-    - Better error handling and validation
-    - Proper tensor type checking for CTC
-    """
+    """Train for one epoch with improved error handling"""
     model.train()
     total_loss = 0
     num_batches = 0
 
     for batch in dataloader:
         try:
-            images, targets, target_lengths = batch
-            images = images.to(device)
-            targets = targets.to(device)
-            target_lengths = target_lengths.to(device)
+            loss = _process_training_batch(
+                batch, model, optimizer, device, use_sam)
 
-            # FIXED: Ensure proper tensor types for CTC
-            if target_lengths.dtype != torch.long:
-                target_lengths = target_lengths.long()
-            if targets.dtype != torch.long:
-                targets = targets.long()
-
-            if use_sam:
-                # SAM training step
-                def closure():
-                    optimizer.zero_grad()
-                    logits, loss = model(images, targets, target_lengths)
-                    loss.backward()
-                    return loss
-
-                # First forward-backward pass
-                loss = closure()
-                optimizer.first_step(zero_grad=True)
-
-                # Second forward-backward pass
-                closure()
-                optimizer.second_step(zero_grad=True)
-            else:
-                # Standard training step
-                optimizer.zero_grad()
-                logits, loss = model(images, targets, target_lengths)
-
-                # FIXED: Check for invalid loss values
-                if torch.isnan(loss) or torch.isinf(loss):
-                    continue
-
-                loss.backward()
-
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_norm=1.0)
-
-                optimizer.step()
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(
+                    f"Warning: Invalid loss value {loss.item()}, skipping batch")
+                continue
 
             total_loss += loss.item()
             num_batches += 1
@@ -760,18 +710,58 @@ def train_epoch(model, dataloader, optimizer, device, vocab, use_sam=False):
                 print(f"Batch {num_batches}, Loss: {loss.item():.4f}")
 
         except Exception as e:
+            print(f"Error in batch {num_batches}: {e}")
             continue
 
     return total_loss / num_batches if num_batches > 0 else float('inf')
 
 
-def validate(model, dataloader, device, decoder):
-    """Validate the model
+def _process_training_batch(batch, model, optimizer, device, use_sam):
+    """Process a single training batch"""
+    images, targets, target_lengths = batch
+    images = images.to(device)
+    targets = targets.to(device, dtype=torch.long)
+    target_lengths = target_lengths.to(device, dtype=torch.long)
 
-    FIXED ISSUES:
-    - Proper handling of CTC output format
-    - Better error handling for malformed data
-    """
+    if use_sam:
+        return _sam_training_step(model, optimizer, images, targets, target_lengths)
+    else:
+        return _standard_training_step(model, optimizer, images, targets, target_lengths)
+
+
+def _sam_training_step(model, optimizer, images, targets, target_lengths):
+    """SAM training step"""
+    def closure():
+        optimizer.zero_grad()
+        logits, loss = model(images, targets, target_lengths)
+        loss.backward()
+        return loss
+
+    # First forward-backward pass
+    loss = closure()
+    optimizer.first_step(zero_grad=True)
+
+    # Second forward-backward pass
+    closure()
+    optimizer.second_step(zero_grad=True)
+    return loss
+
+
+def _standard_training_step(model, optimizer, images, targets, target_lengths):
+    """Standard training step"""
+    optimizer.zero_grad()
+    logits, loss = model(images, targets, target_lengths)
+    loss.backward()
+
+    # Gradient clipping
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optimizer.step()
+
+    return loss
+
+
+def validate(model, dataloader, device, decoder):
+    """Validate the model with improved accuracy calculation"""
     model.eval()
     total_loss = 0
     num_batches = 0
@@ -783,51 +773,75 @@ def validate(model, dataloader, device, decoder):
             try:
                 images, targets, target_lengths = batch
                 images = images.to(device)
-                targets = targets.to(device)
-                target_lengths = target_lengths.to(device)
-
-                # FIXED: Ensure proper tensor types for CTC
-                if target_lengths.dtype != torch.long:
-                    target_lengths = target_lengths.long()
+                targets = targets.to(device, dtype=torch.long)
+                target_lengths = target_lengths.to(device, dtype=torch.long)
 
                 logits, loss = model(images, targets, target_lengths)
                 total_loss += loss.item()
                 num_batches += 1
 
-                # Decode predictions
-                for i in range(logits.size(1)):  # batch dimension
-                    pred_logits = logits[:, i, :]  # [seq_len, vocab_size]
-                    predicted = decoder.greedy_decode(pred_logits)
-
-                    # Compare with ground truth (simplified)
-                    # FIXED: Better handling of target extraction
-                    if i < len(target_lengths):
-                        target_len = target_lengths[i].item()
-                        if target_len > 0 and target_len <= targets.size(0):
-                            # Find start position for this target in concatenated tensor
-                            start_pos = sum(
-                                target_lengths[:i]).item() if i > 0 else 0
-                            end_pos = start_pos + target_len
-                            target_seq = targets[start_pos:end_pos].cpu(
-                            ).numpy()
-                        else:
-                            target_seq = []
-                    else:
-                        target_seq = []
-
-                    # Character-level accuracy (simplified)
-                    min_len = min(len(predicted), len(target_seq))
-                    if min_len > 0:
-                        correct_chars += sum(1 for j in range(min_len)
-                                             if predicted[j] == target_seq[j])
-                    total_chars += max(len(predicted), len(target_seq))
+                # Calculate character accuracy
+                batch_correct, batch_total = _calculate_batch_accuracy(
+                    logits, targets, target_lengths, decoder
+                )
+                correct_chars += batch_correct
+                total_chars += batch_total
 
             except Exception as e:
+                print(f"Error in validation batch: {e}")
                 continue
 
     char_accuracy = correct_chars / total_chars if total_chars > 0 else 0
     avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
     return avg_loss, char_accuracy
+
+
+def _calculate_batch_accuracy(logits, targets, target_lengths, decoder):
+    """Calculate character accuracy for a batch"""
+    correct_chars = 0
+    total_chars = 0
+
+    batch_size = logits.size(1)
+
+    for i in range(batch_size):
+        try:
+            # Get prediction
+            pred_logits = logits[:, i, :]  # [seq_len, vocab_size]
+            predicted = decoder.greedy_decode(pred_logits)
+
+            # Get ground truth
+            target_seq = _extract_target_sequence(targets, target_lengths, i)
+
+            # Calculate accuracy
+            min_len = min(len(predicted), len(target_seq))
+            if min_len > 0:
+                correct_chars += sum(1 for j in range(min_len)
+                                     if predicted[j] == target_seq[j])
+            total_chars += max(len(predicted), len(target_seq))
+
+        except Exception:
+            continue
+
+    return correct_chars, total_chars
+
+
+def _extract_target_sequence(targets, target_lengths, batch_idx):
+    """Extract target sequence for a specific batch index"""
+    if batch_idx >= len(target_lengths):
+        return []
+
+    target_len = target_lengths[batch_idx].item()
+    if target_len <= 0:
+        return []
+
+    # Find start position for this target in concatenated tensor
+    start_pos = sum(target_lengths[:batch_idx]).item() if batch_idx > 0 else 0
+    end_pos = start_pos + target_len
+
+    if end_pos > targets.size(0):
+        return []
+
+    return targets[start_pos:end_pos].cpu().numpy()
 
 # Example usage and inference
 
@@ -843,8 +857,7 @@ def inference_example(model, image_path, decoder, device):
     # Convert to tensor
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[
-                             0.229, 0.224, 0.225])
+        transforms.Normalize(**DEFAULT_NORMALIZATION)
     ])
     image_tensor = transform(image).unsqueeze(0).to(device)
 
@@ -869,11 +882,7 @@ def inference_example(model, image_path, decoder, device):
 
 def create_model_example():
     """Example of how to create and initialize the model"""
-
-    # Define vocabulary (example)
-    vocab = ['<blank>'] + \
-        list('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,!?;: ')
-    vocab_size = len(vocab)
+    vocab_size = len(DEFAULT_VOCAB)
 
     # Create model
     model = HTRModel(
@@ -882,16 +891,15 @@ def create_model_example():
         target_height=40,
         chunk_width=320,
         stride=240,
-        padding=40,
         embed_dims=[64, 192, 384],
         num_heads=[1, 3, 6],
         depths=[1, 2, 10]
     )
 
     # Create decoder
-    decoder = CTCDecoder(vocab, lm_path=None)  # Set lm_path for KenLM
+    decoder = CTCDecoder(DEFAULT_VOCAB, lm_path=None)  # Set lm_path for KenLM
 
-    return model, decoder, vocab
+    return model, decoder, DEFAULT_VOCAB
 
 
 if __name__ == "__main__":
