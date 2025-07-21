@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from train_iam import IAMDataset
+from train_iam import IAMDataset, collate_fn
 from data.transform import get_transform
 from model.HTR_ME import HTRModel
 from utils.utils import CTCLabelConverter
@@ -64,7 +64,8 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=4,
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=collate_fn
     )
 
     val_loader = DataLoader(
@@ -72,7 +73,8 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=4,
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=collate_fn
     )
 
     print(f"Train samples: {len(train_dataset)}")

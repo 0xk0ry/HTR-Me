@@ -93,13 +93,19 @@ class ImprovedHTRTrainer:
         losses = []
         start_time = time.time()
         
-        for batch_idx, (images, labels) in enumerate(self.train_loader):
-            images = images.to(self.device)
-            
-            # Convert labels
-            text_for_loss, length_for_loss = self.converter.encode(labels)
-            text_for_loss = text_for_loss.to(self.device)
-            length_for_loss = length_for_loss.to(self.device)
+        for batch_idx, batch_data in enumerate(self.train_loader):
+            # Handle collate_fn output format
+            if len(batch_data) == 5:  # collate_fn format
+                images, targets_tensor, text_lengths_tensor, texts, image_names = batch_data
+                images = images.to(self.device)
+                text_for_loss = targets_tensor.to(self.device)
+                length_for_loss = text_lengths_tensor.to(self.device)
+            else:  # Standard format
+                images, labels = batch_data
+                images = images.to(self.device)
+                text_for_loss, length_for_loss = self.converter.encode(labels)
+                text_for_loss = text_for_loss.to(self.device)
+                length_for_loss = length_for_loss.to(self.device)
             
             # Forward pass
             self.optimizer.zero_grad()
@@ -156,14 +162,22 @@ class ImprovedHTRTrainer:
         all_ground_truths = []
         
         with torch.no_grad():
-            for images, labels in self.val_loader:
-                images = images.to(self.device)
-                batch_size = images.size(0)
+            for batch_data in self.val_loader:
+                # Handle collate_fn output format
+                if len(batch_data) == 5:  # collate_fn format
+                    images, targets_tensor, text_lengths_tensor, texts, image_names = batch_data
+                    images = images.to(self.device)
+                    text_for_loss = targets_tensor.to(self.device)
+                    length_for_loss = text_lengths_tensor.to(self.device)
+                    labels = texts  # Use texts for metric calculation
+                else:  # Standard format
+                    images, labels = batch_data
+                    images = images.to(self.device)
+                    text_for_loss, length_for_loss = self.converter.encode(labels)
+                    text_for_loss = text_for_loss.to(self.device)
+                    length_for_loss = length_for_loss.to(self.device)
                 
-                # Convert labels for loss calculation
-                text_for_loss, length_for_loss = self.converter.encode(labels)
-                text_for_loss = text_for_loss.to(self.device)
-                length_for_loss = length_for_loss.to(self.device)
+                batch_size = images.size(0)
                 
                 # Forward pass
                 logits, logit_lengths = self.model(images)
