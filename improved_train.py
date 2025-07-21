@@ -51,7 +51,7 @@ def main():
     )
 
     val_dataset = IAMDataset(
-        root=args.data_dir,
+        data_dir=args.data_dir,
         split='val',
         # No augmentation for validation
         transform=get_transform(augment=False),
