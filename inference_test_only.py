@@ -1,6 +1,7 @@
 """
 Inference script for HTR model with CvT backbone - Test Images Only
 This version only processes images that contain 'test' in their filename
+Uses corrected CER/WER calculation matching HTR_VT validation method
 """
 
 import torch
@@ -9,6 +10,7 @@ import argparse
 from pathlib import Path
 from PIL import Image
 import sys
+import re
 sys.path.append('.')
 
 try:
@@ -28,28 +30,91 @@ except ImportError:
     import editdistance
 
 
+def format_string_for_wer(str_input):
+    """Format string for WER calculation by adding spaces around punctuation"""
+    str_input = re.sub('([\[\]{}/\\()\"\'&+*=<>?.;:,!\-—_€#%°])', r' \1 ', str_input)
+    str_input = re.sub('([ \n])+', " ", str_input).strip()
+    return str_input
+
+
 def calculate_cer(predicted, ground_truth):
-    """Calculate Character Error Rate (CER)"""
+    """Calculate Character Error Rate (CER) using edit distance"""
     if len(ground_truth) == 0:
         return 0.0 if len(predicted) == 0 else 1.0
-
+    
     # Calculate edit distance between characters
     distance = editdistance.eval(predicted, ground_truth)
     return distance / len(ground_truth)
 
 
 def calculate_wer(predicted, ground_truth):
-    """Calculate Word Error Rate (WER)"""
+    """Calculate Word Error Rate (WER) using edit distance"""
+    # Format strings for WER calculation (add spaces around punctuation)
+    pred_formatted = format_string_for_wer(predicted)
+    gt_formatted = format_string_for_wer(ground_truth)
+    
     # Split into words
-    pred_words = predicted.split()
-    gt_words = ground_truth.split()
-
+    pred_words = pred_formatted.split()
+    gt_words = gt_formatted.split()
+    
     if len(gt_words) == 0:
         return 0.0 if len(pred_words) == 0 else 1.0
-
+    
     # Calculate edit distance between word lists
     distance = editdistance.eval(pred_words, gt_words)
     return distance / len(gt_words)
+
+
+def calculate_metrics_batch(predictions_greedy, predictions_beam, ground_truths):
+    """
+    Calculate CER and WER using the same method as HTR_VT validation
+    Accumulates total edit distances and lengths, then calculates final metrics
+    """
+    # Initialize accumulators
+    total_cer_distance_greedy = 0
+    total_cer_distance_beam = 0
+    total_wer_distance_greedy = 0
+    total_wer_distance_beam = 0
+    total_char_length = 0
+    total_word_length = 0
+    
+    for pred_greedy, pred_beam, gt in zip(predictions_greedy, predictions_beam, ground_truths):
+        # CER calculation
+        cer_dist_greedy = editdistance.eval(pred_greedy, gt)
+        cer_dist_beam = editdistance.eval(pred_beam, gt)
+        total_cer_distance_greedy += cer_dist_greedy
+        total_cer_distance_beam += cer_dist_beam
+        total_char_length += len(gt)
+        
+        # WER calculation
+        pred_greedy_formatted = format_string_for_wer(pred_greedy)
+        pred_beam_formatted = format_string_for_wer(pred_beam)
+        gt_formatted = format_string_for_wer(gt)
+        
+        pred_greedy_words = pred_greedy_formatted.split()
+        pred_beam_words = pred_beam_formatted.split()
+        gt_words = gt_formatted.split()
+        
+        wer_dist_greedy = editdistance.eval(pred_greedy_words, gt_words)
+        wer_dist_beam = editdistance.eval(pred_beam_words, gt_words)
+        total_wer_distance_greedy += wer_dist_greedy
+        total_wer_distance_beam += wer_dist_beam
+        total_word_length += len(gt_words)
+    
+    # Calculate final metrics
+    if total_char_length > 0:
+        cer_greedy = total_cer_distance_greedy / total_char_length
+        cer_beam = total_cer_distance_beam / total_char_length
+    else:
+        cer_greedy = cer_beam = 0.0
+    
+    if total_word_length > 0:
+        wer_greedy = total_wer_distance_greedy / total_word_length
+        wer_beam = total_wer_distance_beam / total_word_length
+    else:
+        wer_greedy = wer_beam = 0.0
+    
+    return cer_greedy, cer_beam, wer_greedy, wer_beam
 
 
 def load_ground_truth(image_path):
@@ -131,13 +196,11 @@ def batch_inference_test_only(model, decoder, image_dir, output_file, device):
     """Run inference on test images only in a directory"""
     image_dir = Path(image_dir)
     results = []
-
-    # Metrics tracking
-    total_cer_greedy = 0
-    total_cer_beam = 0
-    total_wer_greedy = 0
-    total_wer_beam = 0
-    valid_samples = 0
+    
+    # Collect predictions and ground truths for batch metric calculation
+    predictions_greedy = []
+    predictions_beam = []
+    ground_truths = []
 
     # Supported image extensions
     extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
@@ -150,10 +213,10 @@ def batch_inference_test_only(model, decoder, image_dir, output_file, device):
         test_files = [f for f in pattern_files if 'test' in f.stem.lower()]
         image_files.extend(test_files)
         
-        # # Also check uppercase extensions
-        # pattern_files = image_dir.glob(f"*{ext.upper()}")
-        # test_files = [f for f in pattern_files if 'test' in f.stem.lower()]
-        # image_files.extend(test_files)
+        # Also check uppercase extensions
+        pattern_files = image_dir.glob(f"*{ext.upper()}")
+        test_files = [f for f in pattern_files if 'test' in f.stem.lower()]
+        image_files.extend(test_files)
 
     # Remove duplicates and sort
     image_files = sorted(list(set(image_files)))
@@ -182,14 +245,12 @@ def batch_inference_test_only(model, decoder, image_dir, output_file, device):
                 'ground_truth': ground_truth
             }
 
-            # Calculate metrics if ground truth is available
+            # Calculate individual metrics for display
             if ground_truth is not None:
                 cer_greedy = calculate_cer(prediction['greedy'], ground_truth)
-                cer_beam = calculate_cer(
-                    prediction['beam_search'], ground_truth)
+                cer_beam = calculate_cer(prediction['beam_search'], ground_truth)
                 wer_greedy = calculate_wer(prediction['greedy'], ground_truth)
-                wer_beam = calculate_wer(
-                    prediction['beam_search'], ground_truth)
+                wer_beam = calculate_wer(prediction['beam_search'], ground_truth)
 
                 result.update({
                     'cer_greedy': cer_greedy,
@@ -198,27 +259,22 @@ def batch_inference_test_only(model, decoder, image_dir, output_file, device):
                     'wer_beam_search': wer_beam
                 })
 
-                # Accumulate for average
-                total_cer_greedy += cer_greedy
-                total_cer_beam += cer_beam
-                total_wer_greedy += wer_greedy
-                total_wer_beam += wer_beam
-                valid_samples += 1
+                # Collect for batch calculation
+                predictions_greedy.append(prediction['greedy'])
+                predictions_beam.append(prediction['beam_search'])
+                ground_truths.append(ground_truth)
 
                 print(f"  Greedy: {prediction['greedy']}")
                 print(f"  Beam Search: {prediction['beam_search']}")
                 print(f"  Ground Truth: {ground_truth}")
-                print(
-                    f"  CER (Greedy/Beam): {cer_greedy:.3f} / {cer_beam:.3f}")
-                print(
-                    f"  WER (Greedy/Beam): {wer_greedy:.3f} / {wer_beam:.3f}")
+                print(f"  CER (Greedy/Beam): {cer_greedy:.3f} / {cer_beam:.3f}")
+                print(f"  WER (Greedy/Beam): {wer_greedy:.3f} / {wer_beam:.3f}")
                 print(f"  Confidence: {prediction['confidence']:.3f}")
             else:
                 print(f"  Greedy: {prediction['greedy']}")
                 print(f"  Beam Search: {prediction['beam_search']}")
                 print(f"  Confidence: {prediction['confidence']:.3f}")
-                print(
-                    f"  Warning: No ground truth found for {image_file.name}")
+                print(f"  Warning: No ground truth found for {image_file.name}")
 
             results.append(result)
 
@@ -230,16 +286,21 @@ def batch_inference_test_only(model, decoder, image_dir, output_file, device):
                 'error': str(e)
             })
 
-    # Calculate and add average metrics
-    if valid_samples > 0:
+    # Calculate batch metrics using HTR_VT method
+    if len(ground_truths) > 0:
+        batch_cer_greedy, batch_cer_beam, batch_wer_greedy, batch_wer_beam = calculate_metrics_batch(
+            predictions_greedy, predictions_beam, ground_truths
+        )
+        
         avg_metrics = {
-            'average_cer_greedy': total_cer_greedy / valid_samples,
-            'average_cer_beam_search': total_cer_beam / valid_samples,
-            'average_wer_greedy': total_wer_greedy / valid_samples,
-            'average_wer_beam_search': total_wer_beam / valid_samples,
-            'samples_with_ground_truth': valid_samples,
+            'batch_cer_greedy': batch_cer_greedy,
+            'batch_cer_beam_search': batch_cer_beam,
+            'batch_wer_greedy': batch_wer_greedy,
+            'batch_wer_beam_search': batch_wer_beam,
+            'samples_with_ground_truth': len(ground_truths),
             'total_test_samples': len(image_files),
-            'filter_used': 'test images only'
+            'filter_used': 'test images only',
+            'calculation_method': 'HTR_VT_style_batch_calculation'
         }
 
         # Add summary to results
@@ -264,14 +325,12 @@ def batch_inference_test_only(model, decoder, image_dir, output_file, device):
     print(f"\\nResults saved to: {output_file}")
 
     # Print summary
-    if valid_samples > 0:
-        print(f"\\nAverage Metrics (based on {valid_samples} test samples):")
-        print(f"CER - Greedy: {avg_metrics['average_cer_greedy']:.3f}")
-        print(
-            f"CER - Beam Search: {avg_metrics['average_cer_beam_search']:.3f}")
-        print(f"WER - Greedy: {avg_metrics['average_wer_greedy']:.3f}")
-        print(
-            f"WER - Beam Search: {avg_metrics['average_wer_beam_search']:.3f}")
+    if len(ground_truths) > 0:
+        print(f"\\nBatch Metrics (HTR_VT style, based on {len(ground_truths)} test samples):")
+        print(f"CER - Greedy: {batch_cer_greedy:.3f}")
+        print(f"CER - Beam Search: {batch_cer_beam:.3f}")
+        print(f"WER - Greedy: {batch_wer_greedy:.3f}")
+        print(f"WER - Beam Search: {batch_wer_beam:.3f}")
 
     return results
 
