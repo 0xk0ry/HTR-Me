@@ -3,7 +3,8 @@ Training script for HTR model with IAM dataset
 Custom dataloader for image.png + image.txt pairs
 """
 
-from model.HTR_ME import HTRModel, CTCDecoder
+# from model.HTR_ME import HTRModel, CTCDecoder
+from model.HTR_ME_improved import HTRModel, CTCDecoder
 from utils.sam import SAM
 import torch
 import torch.nn as nn
