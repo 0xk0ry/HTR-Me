@@ -1,5 +1,6 @@
 """
-Inference script for HTR model with CvT backbone
+Inference script for HTR model with CvT backbone - Test Images Only
+This version only processes images that contain 'test' in their filename
 """
 
 import torch
@@ -126,8 +127,8 @@ def predict_single_image(model, decoder, image_path, device):
         }
 
 
-def batch_inference(model, decoder, image_dir, output_file, device):
-    """Run inference on all images in a directory"""
+def batch_inference_test_only(model, decoder, image_dir, output_file, device):
+    """Run inference on test images only in a directory"""
     image_dir = Path(image_dir)
     results = []
 
@@ -141,11 +142,26 @@ def batch_inference(model, decoder, image_dir, output_file, device):
     # Supported image extensions
     extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
 
+    # Find all image files that contain 'test' in their name
     image_files = []
     for ext in extensions:
-        image_files.extend(image_dir.glob(f"*{ext}"))
+        # Find files with extension and 'test' in filename
+        pattern_files = image_dir.glob(f"*{ext}")
+        test_files = [f for f in pattern_files if 'test' in f.stem.lower()]
+        image_files.extend(test_files)
+        
+        # # Also check uppercase extensions
+        # pattern_files = image_dir.glob(f"*{ext.upper()}")
+        # test_files = [f for f in pattern_files if 'test' in f.stem.lower()]
+        # image_files.extend(test_files)
 
-    print(f"Found {len(image_files)} images to process")
+    # Remove duplicates and sort
+    image_files = sorted(list(set(image_files)))
+
+    print(f"Found {len(image_files)} test images to process")
+    if len(image_files) == 0:
+        print("No images containing 'test' in filename were found!")
+        return []
 
     for image_file in image_files:
         print(f"Processing: {image_file.name}")
@@ -222,7 +238,8 @@ def batch_inference(model, decoder, image_dir, output_file, device):
             'average_wer_greedy': total_wer_greedy / valid_samples,
             'average_wer_beam_search': total_wer_beam / valid_samples,
             'samples_with_ground_truth': valid_samples,
-            'total_samples': len(image_files)
+            'total_test_samples': len(image_files),
+            'filter_used': 'test images only'
         }
 
         # Add summary to results
@@ -232,7 +249,11 @@ def batch_inference(model, decoder, image_dir, output_file, device):
         }
     else:
         final_results = {
-            'summary': {'note': 'No ground truth files found for metric calculation'},
+            'summary': {
+                'note': 'No ground truth files found for metric calculation',
+                'total_test_samples': len(image_files),
+                'filter_used': 'test images only'
+            },
             'detailed_results': results
         }
 
@@ -244,7 +265,7 @@ def batch_inference(model, decoder, image_dir, output_file, device):
 
     # Print summary
     if valid_samples > 0:
-        print(f"\\nAverage Metrics (based on {valid_samples} samples):")
+        print(f"\\nAverage Metrics (based on {valid_samples} test samples):")
         print(f"CER - Greedy: {avg_metrics['average_cer_greedy']:.3f}")
         print(
             f"CER - Beam Search: {avg_metrics['average_cer_beam_search']:.3f}")
@@ -256,15 +277,15 @@ def batch_inference(model, decoder, image_dir, output_file, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='HTR Model Inference')
+    parser = argparse.ArgumentParser(description='HTR Model Inference - Test Images Only')
     parser.add_argument('--checkpoint', type=str,
                         required=True, help='Path to model checkpoint')
     parser.add_argument('--image', type=str,
                         help='Path to single image for inference')
     parser.add_argument('--image_dir', type=str,
-                        help='Directory containing images for batch inference')
+                        help='Directory containing images for batch inference (will only process test images)')
     parser.add_argument(
-        '--output', type=str, default='inference_results.json', help='Output file for results')
+        '--output', type=str, default='inference_test_results.json', help='Output file for results')
     parser.add_argument('--lm_path', type=str,
                         help='Path to KenLM language model')
     parser.add_argument('--beam_width', type=int, default=100,
@@ -338,15 +359,16 @@ def main():
             json.dump(result, f, indent=2, ensure_ascii=False)
 
     elif args.image_dir:
-        # Batch inference
-        print(f"\\nProcessing images in directory: {args.image_dir}")
-        results = batch_inference(
+        # Batch inference for test images only
+        print(f"\\nProcessing test images in directory: {args.image_dir}")
+        print("Note: Only processing images with 'test' in their filename")
+        results = batch_inference_test_only(
             model, decoder, args.image_dir, args.output, device)
 
         # Print summary
         successful = sum(1 for r in results if 'error' not in r)
         print(f"\\nSummary:")
-        print(f"Total images: {len(results)}")
+        print(f"Total test images: {len(results)}")
         print(f"Successful: {successful}")
         print(f"Failed: {len(results) - successful}")
 

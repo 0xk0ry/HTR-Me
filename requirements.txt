@@ -17,3 +17,5 @@ tensorboard>=2.5.0
 # Data handling
 h5py>=3.1.0
 scipy>=1.7.0
+
+editdistance>=0.1.0  # For edit distance calculations
