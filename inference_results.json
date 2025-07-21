@@ -1,0 +1,6 @@
+{
+  "image_path": ".\\inference_data\\huyfemboi.png",
+  "greedy_prediction": "trthey tarnboar.",
+  "beam_search_prediction": "trthey tarnboar.",
+  "confidence": 0.7593675851821899
+}
