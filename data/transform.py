@@ -332,3 +332,51 @@ class Tightening:
         indices_to_removed = np.logical_and(np.random.choice([True, False], size=len(x_np), replace=True, p=[self.remove_proba, 1-self.remove_proba]), interline_indices)
         new_x = x_np[np.logical_not(indices_to_removed)]
         return Image.fromarray(new_x.astype(np.uint8))
+
+
+def get_transform(augment=False):
+    """
+    Get transform pipeline for HTR training
+    
+    Args:
+        augment (bool): Whether to apply data augmentation
+        
+    Returns:
+        Transform pipeline
+    """
+    import torchvision.transforms as transforms
+    
+    if augment:
+        # Training transforms with data augmentation
+        transform_list = [
+            # Morphological operations (light)
+            transforms.RandomApply([
+                Erosion(kernel=(2, 2), iterations=1)
+            ], p=0.3),
+            
+            transforms.RandomApply([
+                Dilation(kernel=(2, 2), iterations=1) 
+            ], p=0.3),
+            
+            # Geometric distortions (light)
+            transforms.RandomApply([
+                ElasticDistortion(grid=(8, 8), magnitude=(1, 1), min_sep=(4, 4))
+            ], p=0.2),
+            
+            # Add some photometric distortions
+            transforms.RandomApply([
+                GaussianNoise(std=5)
+            ], p=0.3),
+            
+            # Final normalization
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ]
+    else:
+        # Validation/test transforms (no augmentation)
+        transform_list = [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ]
+    
+    return transforms.Compose(transform_list)
