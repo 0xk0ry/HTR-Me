@@ -109,14 +109,30 @@ class ImprovedHTRTrainer:
             
             # Forward pass
             self.optimizer.zero_grad()
-            logits, logit_lengths = self.model(images)
             
-            # Reshape for CTC loss
-            logits = logits.permute(1, 0, 2)  # [seq_len, batch, vocab_size]
-            logits = logits.log_softmax(2)
-            
-            # Calculate loss
-            loss = self.criterion(logits, text_for_loss, logit_lengths, length_for_loss)
+            if len(batch_data) == 5:  # collate_fn format - use model's internal CTC loss
+                images, targets_tensor, text_lengths_tensor, texts, image_names = batch_data
+                images = images.to(self.device)
+                targets_tensor = targets_tensor.to(self.device)
+                text_lengths_tensor = text_lengths_tensor.to(self.device)
+                
+                # Model calculates CTC loss internally when targets are provided
+                logits, loss = self.model(images, targets_tensor, text_lengths_tensor)
+            else:  # Standard format - manual CTC loss calculation
+                images, labels = batch_data
+                images = images.to(self.device)
+                text_for_loss, length_for_loss = self.converter.encode(labels)
+                text_for_loss = text_for_loss.to(self.device)
+                length_for_loss = length_for_loss.to(self.device)
+                
+                logits, input_lengths = self.model(images)
+                
+                # Reshape for CTC loss
+                logits = logits.permute(1, 0, 2)  # [seq_len, batch, vocab_size]
+                logits = logits.log_softmax(2)
+                
+                # Calculate loss
+                loss = self.criterion(logits, text_for_loss, input_lengths, length_for_loss)
             
             # Backward pass with gradient clipping
             loss.backward()
@@ -179,17 +195,24 @@ class ImprovedHTRTrainer:
                 
                 batch_size = images.size(0)
                 
-                # Forward pass
-                logits, logit_lengths = self.model(images)
+                # Forward pass - use inference mode (no targets)
+                logits, input_lengths = self.model(images)
                 
-                # Calculate loss
-                logits_for_loss = logits.permute(1, 0, 2).log_softmax(2)
-                loss = self.criterion(logits_for_loss, text_for_loss, logit_lengths, length_for_loss)
+                # Calculate loss manually for validation
+                if len(batch_data) == 5:  # collate_fn format
+                    # Use pre-encoded targets from collate_fn
+                    logits_for_loss = logits.permute(1, 0, 2).log_softmax(2)
+                    loss = self.criterion(logits_for_loss, text_for_loss, input_lengths, length_for_loss)
+                else:
+                    # Standard format - encode targets manually
+                    logits_for_loss = logits.permute(1, 0, 2).log_softmax(2)
+                    loss = self.criterion(logits_for_loss, text_for_loss, input_lengths, length_for_loss)
+                
                 total_loss += loss.item()
                 
                 # Decode predictions
                 for i in range(batch_size):
-                    seq_len = logit_lengths[i].item()
+                    seq_len = input_lengths[i].item()
                     pred_logits = logits[:seq_len, i, :]
                     
                     # Greedy decoding
@@ -220,9 +243,13 @@ class ImprovedHTRTrainer:
                     all_ground_truths.append(ground_truth)
         
         # Calculate average metrics
+        if len(self.val_loader) == 0:
+            print("Warning: No validation batches processed!")
+            return float('inf'), 1.0, 1.0, [], []
+        
         avg_loss = total_loss / len(self.val_loader)
-        avg_cer = total_cer / total_chars if total_chars > 0 else 0
-        avg_wer = total_wer / total_words if total_words > 0 else 0
+        avg_cer = total_cer / total_chars if total_chars > 0 else 1.0
+        avg_wer = total_wer / total_words if total_words > 0 else 1.0
         
         # Update scheduler if using ReduceLROnPlateau
         if self.scheduler and isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
