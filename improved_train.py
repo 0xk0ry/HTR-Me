@@ -52,7 +52,7 @@ def main():
 
     val_dataset = IAMDataset(
         data_dir=args.data_dir,
-        split='val',
+        split='valid',
         # No augmentation for validation
         transform=get_transform(augment=False),
         target_height=40
@@ -78,7 +78,7 @@ def main():
     )
 
     print(f"Train samples: {len(train_dataset)}")
-    print(f"Val samples: {len(val_dataset)}")
+    print(f"Valid samples: {len(val_dataset)}")
 
     # Create model
     vocab = train_dataset.vocab
