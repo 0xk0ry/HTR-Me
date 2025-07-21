@@ -39,7 +39,7 @@ def main():
     transform = get_transform(augment=True)  # Enable augmentation for training
     
     train_dataset = IAMDataset(
-        root=args.data_dir,
+        data_dir=args.data_dir,
         split='train',
         transform=transform,
         target_height=40,

@@ -8,10 +8,12 @@ from cv2 import erode, dilate, normalize
 from torchvision.transforms import RandomCrop
 import math
 
+
 class Dilation:
     """
     OCR: stroke width increasing
     """
+
     def __init__(self, kernel, iterations):
         self.kernel = np.ones(kernel, np.uint8)
         self.iterations = iterations
@@ -59,29 +61,34 @@ class ElasticDistortion:
         height_of_last_square = h - (height_of_square * (vertical_tiles - 1))
 
         dimensions = []
-        shift = [[(0, 0) for x in range(horizontal_tiles)] for y in range(vertical_tiles)]
+        shift = [[(0, 0) for x in range(horizontal_tiles)]
+                 for y in range(vertical_tiles)]
 
         for vertical_tile in range(vertical_tiles):
             for horizontal_tile in range(horizontal_tiles):
                 if vertical_tile == (vertical_tiles - 1) and horizontal_tile == (horizontal_tiles - 1):
                     dimensions.append([horizontal_tile * width_of_square,
                                        vertical_tile * height_of_square,
-                                       width_of_last_square + (horizontal_tile * width_of_square),
+                                       width_of_last_square +
+                                       (horizontal_tile * width_of_square),
                                        height_of_last_square + (height_of_square * vertical_tile)])
                 elif vertical_tile == (vertical_tiles - 1):
                     dimensions.append([horizontal_tile * width_of_square,
                                        vertical_tile * height_of_square,
-                                       width_of_square + (horizontal_tile * width_of_square),
+                                       width_of_square +
+                                       (horizontal_tile * width_of_square),
                                        height_of_last_square + (height_of_square * vertical_tile)])
                 elif horizontal_tile == (horizontal_tiles - 1):
                     dimensions.append([horizontal_tile * width_of_square,
                                        vertical_tile * height_of_square,
-                                       width_of_last_square + (horizontal_tile * width_of_square),
+                                       width_of_last_square +
+                                       (horizontal_tile * width_of_square),
                                        height_of_square + (height_of_square * vertical_tile)])
                 else:
                     dimensions.append([horizontal_tile * width_of_square,
                                        vertical_tile * height_of_square,
-                                       width_of_square + (horizontal_tile * width_of_square),
+                                       width_of_square +
+                                       (horizontal_tile * width_of_square),
                                        height_of_square + (height_of_square * vertical_tile)])
 
                 sm_h = min(self.xmagnitude,
@@ -101,7 +108,8 @@ class ElasticDistortion:
         for i in range(vertical_tiles):
             last_column.append((horizontal_tiles - 1) + horizontal_tiles * i)
 
-        last_row = range((horizontal_tiles * vertical_tiles) - horizontal_tiles, horizontal_tiles * vertical_tiles)
+        last_row = range((horizontal_tiles * vertical_tiles) -
+                         horizontal_tiles, horizontal_tiles * vertical_tiles)
 
         polygons = []
         for x1, y1, x2, y2 in dimensions:
@@ -110,7 +118,8 @@ class ElasticDistortion:
         polygon_indices = []
         for i in range((vertical_tiles * horizontal_tiles) - 1):
             if i not in last_row and i not in last_column:
-                polygon_indices.append([i, i + 1, i + horizontal_tiles, i + 1 + horizontal_tiles])
+                polygon_indices.append(
+                    [i, i + 1, i + horizontal_tiles, i + 1 + horizontal_tiles])
 
         for id, (a, b, c, d) in enumerate(polygon_indices):
             dx = shift[id][0]
@@ -148,12 +157,14 @@ class ElasticDistortion:
 
         return x.transform(x.size, Image.MESH, self.generated_mesh, resample=Image.BICUBIC)
 
+
 class RandomTransform:
     """
     Random Transform adapted from https://github.com/IntuitionMachines/OrigamiNet
     Used in "OrigamiNet: Weakly-Supervised, Segmentation-Free, One-Step, Full Page TextRecognition by learning to unfold",
         Yousef, Mohamed and Bishop, Tom E., The IEEE Conference on Computer Vision and Pattern Recognition (CVPR), 2020
     """
+
     def __init__(self, val):
 
         self.val = val
@@ -181,7 +192,7 @@ class RandomTransform:
         br_right = fd(min(w * 3 / 4 - bl_left, dw))
 
         tform = stf.ProjectiveTransform()
-        tform.estimate(np.array((        #从对应点估计变换矩阵
+        tform.estimate(np.array((  # 从对应点估计变换矩阵
             (tl_left, tl_top),
             (bl_left, h - bl_bottom),
             (w - br_right, h - br_bottom),
@@ -218,7 +229,8 @@ class RandomTransform:
         # normalize
         tform.params /= tform.params[2, 2]
 
-        x = stf.warp(np.array(x), tform, output_shape=output_shape, cval=255, preserve_range=True)
+        x = stf.warp(np.array(x), tform, output_shape=output_shape,
+                     cval=255, preserve_range=True)
         x = stf.resize(x, (h, w), preserve_range=True).astype(np.uint8)
 
         return Image.fromarray(x)
@@ -249,7 +261,6 @@ class DPIAdjusting:
         return x.resize((int(np.ceil(w * self.factor)), int(np.ceil(h * self.factor))), Image.BILINEAR)
 
 
-
 class GaussianNoise:
     """
     Add Gaussian Noise
@@ -265,7 +276,8 @@ class GaussianNoise:
         min_, max_ = np.min(x_np,), np.max(x_np)
         normal_noise = np.random.randn(*x_np.shape)
         if len(x_np.shape) == 3 and x_np.shape[2] == 3 and np.all(x_np[:, :, 0] == x_np[:, :, 1]) and np.all(x_np[:, :, 0] == x_np[:, :, 2]):
-            normal_noise[:, :, 1] = normal_noise[:, :, 2] = normal_noise[:, :, 0]
+            normal_noise[:, :, 1] = normal_noise[:,
+                                                 :, 2] = normal_noise[:, :, 0]
         x_np = ((x_np-mean)/std + normal_noise*self.std) * std + mean
         x_np = normalize(x_np, x_np, max_, min_, cv2.NORM_MINMAX)
 
@@ -329,7 +341,8 @@ class Tightening:
     def __call__(self, x):
         x_np = np.array(x)
         interline_indices = [np.all(line == 255) for line in x_np]
-        indices_to_removed = np.logical_and(np.random.choice([True, False], size=len(x_np), replace=True, p=[self.remove_proba, 1-self.remove_proba]), interline_indices)
+        indices_to_removed = np.logical_and(np.random.choice([True, False], size=len(
+            x_np), replace=True, p=[self.remove_proba, 1-self.remove_proba]), interline_indices)
         new_x = x_np[np.logical_not(indices_to_removed)]
         return Image.fromarray(new_x.astype(np.uint8))
 
@@ -337,15 +350,15 @@ class Tightening:
 def get_transform(augment=False):
     """
     Get transform pipeline for HTR training
-    
+
     Args:
         augment (bool): Whether to apply data augmentation
-        
+
     Returns:
         Transform pipeline
     """
     import torchvision.transforms as transforms
-    
+
     if augment:
         # Training transforms with data augmentation
         transform_list = [
@@ -353,30 +366,33 @@ def get_transform(augment=False):
             transforms.RandomApply([
                 Erosion(kernel=(2, 2), iterations=1)
             ], p=0.3),
-            
+
             transforms.RandomApply([
-                Dilation(kernel=(2, 2), iterations=1) 
+                Dilation(kernel=(2, 2), iterations=1)
             ], p=0.3),
-            
+
             # Geometric distortions (light)
             transforms.RandomApply([
-                ElasticDistortion(grid=(8, 8), magnitude=(1, 1), min_sep=(4, 4))
+                ElasticDistortion(
+                    grid=(8, 8), magnitude=(1, 1), min_sep=(4, 4))
             ], p=0.2),
-            
+
             # Add some photometric distortions
             transforms.RandomApply([
                 GaussianNoise(std=5)
             ], p=0.3),
-            
+
             # Final normalization
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[
+                                 0.229, 0.224, 0.225])
         ]
     else:
         # Validation/test transforms (no augmentation)
         transform_list = [
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[
+                                 0.229, 0.224, 0.225])
         ]
-    
+
     return transforms.Compose(transform_list)
