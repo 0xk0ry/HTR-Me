@@ -291,6 +291,16 @@ def _standard_training_step(model, optimizer, images, targets, target_lengths):
     """Standard training step"""
     optimizer.zero_grad()
     logits, loss = model(images, targets, target_lengths)
+    
+    # Check for problematic loss values
+    if torch.isnan(loss) or torch.isinf(loss) or loss.item() == 0.0:
+        print(f"Warning: Problematic loss detected: {loss.item()}")
+        print(f"  Logits shape: {logits.shape}")
+        print(f"  Target lengths: {target_lengths}")
+        print(f"  Input lengths computed in model")
+        # Skip this batch
+        return torch.tensor(0.0, device=loss.device, requires_grad=True)
+    
     loss.backward()
 
     # Gradient clipping

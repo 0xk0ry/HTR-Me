@@ -33,7 +33,7 @@ DEFAULT_NORMALIZATION = {
 # 3-Stage CvT Configuration optimized for HTR
 DEFAULT_CVT_3STAGE_CONFIG = {
     'patch_sizes': [4, 3, 3],    # Gentler initial downsampling
-    'strides': [2, 2, 2],        # Consistent 2x downsampling per stage
+    'strides': [2, 1, 1],        # Only first stage downsamples by 2, others preserve
     'kernel_sizes': [3, 3, 3],   # Convolutional attention kernel sizes
     'mlp_ratios': [4, 4, 4]      # MLP expansion ratios
 }
@@ -168,7 +168,7 @@ class CvT3Stage(nn.Module):
 
     def __init__(self, img_size=320, in_chans=3, num_classes=1000, embed_dims=[64, 192, 384],
                  num_heads=[1, 3, 6], depths=[1, 2, 10], patch_sizes=[4, 3, 3],
-                 strides=[2, 2, 2], kernel_sizes=[3, 3, 3], mlp_ratios=[4, 4, 4],
+                 strides=[2, 1, 1], kernel_sizes=[3, 3, 3], mlp_ratios=[4, 4, 4],
                  qkv_bias=True, drop_rate=0., attn_drop_rate=0.):
         super().__init__()
         self.num_classes = num_classes
@@ -438,8 +438,8 @@ class HTRModel(nn.Module):
             nn.Linear(self.feature_dim // 2, vocab_size)
         )
 
-        # CTC Loss
-        self.ctc_loss = CTCLoss(blank=0, reduction='mean', zero_infinity=True)
+        # CTC Loss (remove zero_infinity to see actual problematic cases)
+        self.ctc_loss = CTCLoss(blank=0, reduction='mean', zero_infinity=False)
 
     def forward(self, images, targets=None, target_lengths=None):
         """Forward pass through the model"""
@@ -503,8 +503,40 @@ class HTRModel(nn.Module):
             if targets.dim() > 1:
                 targets = targets.flatten()
 
-            loss = self.ctc_loss(log_probs, targets,
-                                 input_lengths, target_lengths)
+            # Additional validation and improved CTC loss calculation
+            min_input_length = min(all_lengths)
+            max_target_length = max(target_lengths.tolist())
+            
+            if min_input_length == 0:
+                # Handle zero-length inputs
+                print(f"Warning: Zero-length input sequence detected")
+                loss = torch.tensor(1.0, device=images.device, requires_grad=True)
+            elif max_target_length >= min_input_length:
+                # Target longer than input - problematic for CTC
+                print(f"Warning: Target length ({max_target_length}) >= input length ({min_input_length})")
+                loss = torch.tensor(2.0, device=images.device, requires_grad=True)  # Penalty for invalid alignment
+            else:
+                try:
+                    loss = self.ctc_loss(log_probs, targets,
+                                         input_lengths, target_lengths)
+                    
+                    # Check for problematic loss values
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        print(f"Warning: NaN/Inf loss detected")
+                        print(f"  Input lengths: {input_lengths.tolist()}")
+                        print(f"  Target lengths: {target_lengths.tolist()}")
+                        loss = torch.tensor(2.0, device=images.device, requires_grad=True)
+                    elif loss.item() == 0.0:
+                        print(f"Warning: Exact zero loss detected - potential perfect alignment or numerical issue")
+                        # Don't replace zero loss, but add small epsilon to avoid gradient issues
+                        loss = loss + 1e-8
+                        
+                except Exception as e:
+                    print(f"CTC Loss calculation failed: {e}")
+                    print(f"  Input lengths: {input_lengths.tolist()}")
+                    print(f"  Target lengths: {target_lengths.tolist()}")
+                    loss = torch.tensor(2.0, device=images.device, requires_grad=True)
+                    
             return padded_logits, loss
         else:
             return padded_logits, torch.tensor(all_lengths, device=images.device)
@@ -602,15 +634,19 @@ class HTRModel(nn.Module):
             return features_dict
 
     def _merge_chunk_features(self, chunk_features, chunk_positions):
-        """Merge features from multiple chunks, removing padded and ignored regions"""
+        """Merge features from multiple chunks, being more conservative with feature removal"""
         if not chunk_features:
             return torch.empty(0, self.feature_dim, device='cpu').contiguous()
 
         device = chunk_features[0].device
+        
+        # Be much more conservative with feature removal
         # Calculate stride from final stage
         final_stage = self.cvt.stages[-1]
         patch_stride = final_stage.patch_embed.stride
-        ignore_patches = max(1, self.chunker.padding // patch_stride)
+        
+        # Reduce ignore regions significantly to preserve more sequence length
+        ignore_patches = max(1, self.chunker.padding // (patch_stride * 4))  # Much smaller ignore region
 
         merged_features = []
 
@@ -618,8 +654,8 @@ class HTRModel(nn.Module):
             start_px, end_px, left_pad_px, _ = pos_info
             total_patches = features.size(0)
 
-            # Calculate valid feature range based on chunk type
-            start_idx, end_idx = self._calculate_chunk_bounds(
+            # Be more conservative with bounds calculation
+            start_idx, end_idx = self._calculate_chunk_bounds_conservative(
                 i, len(chunk_positions), total_patches, left_pad_px,
                 end_px - start_px, patch_stride, ignore_patches
             )
@@ -631,6 +667,44 @@ class HTRModel(nn.Module):
                     merged_features.append(valid_features)
 
         return torch.cat(merged_features, dim=0).contiguous() if merged_features else torch.empty(0, self.feature_dim, device=device).contiguous()
+
+    def _calculate_chunk_bounds_conservative(self, chunk_idx, total_chunks, total_patches, left_pad_px, chunk_width_px, patch_stride, ignore_patches):
+        """Calculate start and end indices for valid features in a chunk - more conservative approach"""
+        start_idx = 0
+        end_idx = total_patches
+
+        if total_chunks == 1:
+            # Single chunk: only remove significant padding
+            if left_pad_px > patch_stride * 2:  # Only remove if padding is substantial
+                start_idx = min(left_pad_px // (patch_stride * 2), total_patches - 1)
+            
+            # Be more conservative with right padding too
+            if chunk_width_px < self.chunker.chunk_width - patch_stride * 2:
+                content_ratio = (left_pad_px + chunk_width_px) / self.chunker.chunk_width
+                end_idx = min(max(start_idx + 1, int(content_ratio * total_patches)), total_patches)
+
+        elif chunk_idx == 0:
+            # First chunk: only remove left padding if substantial
+            if left_pad_px > patch_stride * 2:
+                start_idx = min(left_pad_px // (patch_stride * 2), total_patches - 1)
+            end_idx = max(start_idx + 1, total_patches - ignore_patches // 2)  # Smaller ignore region
+
+        elif chunk_idx == total_chunks - 1:
+            # Last chunk: be conservative with both sides
+            if chunk_width_px < self.chunker.chunk_width - patch_stride * 2:
+                content_ratio = chunk_width_px / self.chunker.chunk_width
+                actual_patches = max(1, int(content_ratio * total_patches))
+                start_idx = min(ignore_patches // 2, actual_patches - 1)
+                end_idx = actual_patches
+            else:
+                start_idx = min(ignore_patches // 2, total_patches - 1)
+
+        else:
+            # Middle chunk: smaller ignore regions
+            start_idx = min(ignore_patches // 2, total_patches // 4)
+            end_idx = max(start_idx + 1, total_patches - ignore_patches // 2)
+
+        return start_idx, end_idx
 
     def _calculate_chunk_bounds(self, chunk_idx, total_chunks, total_patches, left_pad_px, chunk_width_px, patch_stride, ignore_patches):
         """Calculate start and end indices for valid features in a chunk"""
